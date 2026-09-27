@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.10">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.10" />
+    <PackageReference Include="SharpCompress" Version="0.50.3" />
+    <PackageReference Include="SkiaSharp" Version="2.88.9" />
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="3.50.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\S3ForgeTools.GameFiles\S3ForgeTools.GameFiles.csproj" />
+    <ProjectReference Include="..\S3ForgeTools.Utils\S3ForgeTools.Utils.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="s3pi.Interfaces">
+      <HintPath>..\libs\s3pi.Interfaces.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="s3pi.Settings">
+      <HintPath>..\libs\s3pi.Settings.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="s3pi.CatalogResource">
+      <HintPath>..\libs\s3pi.CatalogResource.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="s3pi.CASPartResource">
+      <HintPath>..\libs\s3pi.CASPartResource.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
