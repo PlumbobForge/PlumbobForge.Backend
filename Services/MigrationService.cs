@@ -682,6 +682,7 @@ public class MigrationService
                         IsDefault = false
                     };
                     _db.SetsEntities.Add(setEntity);
+                    await _db.SaveChangesAsync();
                     setsByName[modName] = setEntity;
                     totalSetsMigrated++;
                 }
@@ -710,6 +711,7 @@ public class MigrationService
                             Filehash = string.Empty,
                             PackageType = "Unknown",
                             SetsEntityId = setEntity.Id,
+                            SetsEntity = setEntity,
                             Enabled = true
                         };
                         _db.MetaEntities.Add(meta);
@@ -719,6 +721,7 @@ public class MigrationService
                     {
                         meta.CompleteFileName = destPath;
                         meta.SetsEntityId = setEntity.Id;
+                        meta.SetsEntity = setEntity;
                     }
                 }
             }
