@@ -180,38 +180,66 @@ public class CacheBuilderService
                 }
             }
 
-            // Sync SavedSims & Library (Lots) into Documents/Electronic Arts/The Sims 3/
-            var managedSubFolders = new[] { "SavedSims", "Library" };
-            foreach (var folder in managedSubFolders)
+            else
             {
-                string targetDir = Path.Combine(GetSims3FolderPath(), folder);
-                if (Directory.Exists(targetDir))
+                string nonPackageFile = Path.Combine(staticCacheDir, "NonPackageItems.txt");
+                if (File.Exists(nonPackageFile))
                 {
-                    foreach (var file in Directory.GetFiles(targetDir))
+                    foreach (var line in File.ReadAllLines(nonPackageFile))
                     {
-                        if (!targetFilesToSync.ContainsKey(file))
-                        {
-                            try { File.Delete(file); } catch { }
-                        }
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        string fileName = Path.GetFileName(line);
+                        string folder = Path.GetFileName(Path.GetDirectoryName(line)!);
+                        string destPath = GetTS3FolderPath(folder, fileName);
+                        targetFilesToSync[destPath] = line;
                     }
                 }
             }
 
-            // Copy missing target files (SavedSims, Library)
+            // Sync SavedSims & Library (Lots) into Documents/Electronic Arts/The Sims 3/
+            string managedNonPkgFile = Path.Combine(_options.DocumentBaseDir, "ManagedNonPackageItems.txt");
+            var previouslyManagedNonPkg = File.Exists(managedNonPkgFile)
+                ? File.ReadAllLines(managedNonPkgFile).Where(l => !string.IsNullOrWhiteSpace(l)).ToHashSet(StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var oldFile in previouslyManagedNonPkg)
+            {
+                if (!targetFilesToSync.ContainsKey(oldFile))
+                {
+                    if (File.Exists(oldFile))
+                    {
+                        try { File.Delete(oldFile); } catch { }
+                    }
+                }
+            }
+
+            // Copy missing or updated target files (SavedSims, Library)
+            var currentManagedNonPkg = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var kvp in targetFilesToSync)
             {
                 string destPath = kvp.Key;
                 string sourcePath = kvp.Value;
-                if (File.Exists(sourcePath) && !File.Exists(destPath))
+                if (File.Exists(sourcePath))
                 {
                     try
                     {
                         Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
-                        File.Copy(sourcePath, destPath, true);
+                        if (!File.Exists(destPath) || File.GetLastWriteTimeUtc(sourcePath) > File.GetLastWriteTimeUtc(destPath))
+                        {
+                            File.Copy(sourcePath, destPath, overwrite: true);
+                        }
+                        currentManagedNonPkg.Add(destPath);
                     }
                     catch { }
                 }
             }
+
+            // Save the updated list of files PlumbobForge actively manages in SavedSims / Library
+            try
+            {
+                File.WriteAllLines(managedNonPkgFile, currentManagedNonPkg);
+            }
+            catch { }
 
             // Sync Worlds to {The Sims 3 installation}/GameData/Shared/NonPackaged/Worlds/
             string gameInstallDir = !string.IsNullOrWhiteSpace(_options.GameFilesDir) && Directory.Exists(_options.GameFilesDir)
@@ -672,6 +700,16 @@ public class CacheBuilderService
                     File.Move(path, dest);
                 }
                 catch { }
+            }
+
+            string nonPackageFile = Path.Combine(staticCacheDir, "NonPackageItems.txt");
+            if (nonPackageItems.Count > 0)
+            {
+                try { File.WriteAllLines(nonPackageFile, nonPackageItems); } catch { }
+            }
+            else if (File.Exists(nonPackageFile))
+            {
+                try { File.Delete(nonPackageFile); } catch { }
             }
 
             // In Static mode: Clean up old dynamic set folders from Mods/Cache/
