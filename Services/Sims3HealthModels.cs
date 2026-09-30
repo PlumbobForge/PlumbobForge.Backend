@@ -131,18 +131,52 @@ public class PackageConflictItem
     public long? MetaEntityId { get; set; }
     public string? PackageType { get; set; }
     public bool IsEnabled { get; set; } = true;
+    public bool IsWinningInLoadOrder { get; set; }
 }
 
 public class ConflictCardModel
 {
     public string Id { get; set; } = Guid.NewGuid().ToString();
+    public string ConflictFingerprint { get; set; } = string.Empty;
+    public bool IsIgnored { get; set; }
     public ConflictCardCategory Category { get; set; }
     public string Title { get; set; } = string.Empty;
     public string Explanation { get; set; } = string.Empty;
     public string Recommendation { get; set; } = string.Empty;
 
-    public PackageConflictItem PrimaryPackage { get; set; } = new();
-    public PackageConflictItem? SecondaryPackage { get; set; }
+    public List<PackageConflictItem> Packages { get; set; } = new();
+
+    public PackageConflictItem PrimaryPackage
+    {
+        get => Packages.Count > 0 ? Packages[0] : (_primaryPackageFallback ??= new());
+        set
+        {
+            _primaryPackageFallback = value;
+            if (Packages.Count == 0) Packages.Add(value);
+            else Packages[0] = value;
+        }
+    }
+    private PackageConflictItem? _primaryPackageFallback;
+
+    public PackageConflictItem? SecondaryPackage
+    {
+        get => Packages.Count > 1 ? Packages[1] : null;
+        set
+        {
+            if (value != null)
+            {
+                if (Packages.Count < 2)
+                {
+                    if (Packages.Count == 0) Packages.Add(new PackageConflictItem());
+                    Packages.Add(value);
+                }
+                else
+                {
+                    Packages[1] = value;
+                }
+            }
+        }
+    }
 
     public int AffectedResourceCount { get; set; }
     public string AffectedSummary { get; set; } = string.Empty;
@@ -158,6 +192,7 @@ public class HealthScanSummary
     public int DuplicatesCount { get; set; }
     public int OverridesCount { get; set; }
     public int CorruptCount { get; set; }
+    public int IgnoredCount { get; set; }
     public int TotalIssuesCount => IncompatibilitiesCount + DuplicatesCount + OverridesCount + CorruptCount;
 
     public List<ConflictCardModel> ConflictCards { get; set; } = new();

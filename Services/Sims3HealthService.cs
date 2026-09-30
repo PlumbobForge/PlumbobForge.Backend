@@ -523,6 +523,17 @@ public class Sims3HealthService
                 if (!TryReadPackageIndexFast(filePath, out var keys, out ulong checksum, out string? error))
                 {
                     bool isS2 = error?.Contains("Sims 2") == true;
+                    var corruptPkg = new PackageConflictItem
+                    {
+                        PackageFileName = fileName,
+                        PackagePath = filePath,
+                        SetName = setName,
+                        SetId = setId,
+                        MetaEntityId = metaId,
+                        PackageType = packageType,
+                        IsEnabled = isEnabled,
+                        IsWinningInLoadOrder = isEnabled
+                    };
                     corruptCards.Add(new ConflictCardModel
                     {
                         Category = ConflictCardCategory.CorruptFile,
@@ -531,16 +542,8 @@ public class Sims3HealthService
                             ? "This file is in Sims 2 package format. Placing it in The Sims 3 may crash the game on startup."
                             : (error ?? "Package header is broken or truncated and cannot be read by the game."),
                         Recommendation = "We recommend disabling or deleting this file from your library.",
-                        PrimaryPackage = new PackageConflictItem
-                        {
-                            PackageFileName = fileName,
-                            PackagePath = filePath,
-                            SetName = setName,
-                            SetId = setId,
-                            MetaEntityId = metaId,
-                            PackageType = packageType,
-                            IsEnabled = isEnabled
-                        },
+                        Packages = new List<PackageConflictItem> { corruptPkg },
+                        ConflictFingerprint = $"Corrupt:{fileName.ToLowerInvariant()}",
                         TechnicalDetails = new List<string> { error ?? "DBPF format error" }
                     });
                     return;
@@ -587,163 +590,260 @@ public class Sims3HealthService
 
             Array.Clear(packageKeysList, 0, packageKeysList.Length);
 
-            // 4. Pairwise Conflict Aggregator
-            // Map pair key (idLower:idHigher) -> list of shared TGI keys
-            var pairCollisions = new Dictionary<string, (int IdA, int IdB, List<TGI_Key> Keys)>();
+            // 4. Clustered Multi-File Conflict Aggregator
+            var cards = new List<ConflictCardModel>(corruptCards);
+            int incompCount = 0;
+            int dupeCount = 0;
+            int overrideCount = 0;
+
+            // Step A: Exact Duplicates (Clustered by Checksum & ResourceCount)
+            var handledDuplicatePackageIds = new HashSet<int>();
+            var dupeGroups = packagesMeta
+                .Where(p => p.ResourceCount > 0)
+                .GroupBy(p => (p.ResourceCount, p.ContentChecksum))
+                .Where(g => g.Count() > 1)
+                .ToList();
+
+            foreach (var group in dupeGroups)
+            {
+                var groupList = group.ToList();
+                foreach (var p in groupList)
+                {
+                    handledDuplicatePackageIds.Add(p.Id);
+                }
+
+                dupeCount++;
+                bool isIntraSet = groupList.Select(p => p.SetName).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 1;
+                string setName = groupList[0].SetName;
+                var samplePkg = groupList[0];
+
+                var pkgItems = groupList.Select(p => new PackageConflictItem
+                {
+                    PackageFileName = p.FileName,
+                    PackagePath = p.FilePath,
+                    SetName = p.SetName,
+                    SetId = p.SetId,
+                    MetaEntityId = p.MetaEntityId,
+                    PackageType = p.PackageType,
+                    IsEnabled = p.IsEnabled
+                }).ToList();
+
+                ComputeLoadOrderWinners(pkgItems);
+
+                string fingerprint = $"Duplicate:{string.Join("|", groupList.Select(x => x.FileName.ToLowerInvariant()).OrderBy(x => x))}";
+
+                cards.Add(new ConflictCardModel
+                {
+                    Category = ConflictCardCategory.Duplicate,
+                    Title = isIntraSet
+                        ? $"Exact Duplicate ({groupList.Count} copies in '{setName}')"
+                        : $"Exact Duplicate ({groupList.Count} copies across sets)",
+                    Explanation = isIntraSet
+                        ? $"All {groupList.Count} files in Set '{setName}' are identical copies with matching content checksums."
+                        : $"Found {groupList.Count} identical copies of '{samplePkg.FileName}' across your sets.",
+                    Recommendation = "Keep only one copy enabled to save game memory and load time.",
+                    Packages = pkgItems,
+                    AffectedResourceCount = samplePkg.ResourceCount,
+                    AffectedSummary = $"{samplePkg.ResourceCount} identical resources",
+                    IsIntraSet = isIntraSet,
+                    ConflictFingerprint = fingerprint,
+                    TechnicalDetails = new List<string> { $"Checksum: {samplePkg.ContentChecksum:X16}, Resources: {samplePkg.ResourceCount}" }
+                });
+            }
+
+            // Step B: Mod Tuning Incompatibilities (Connected components of tuning collisions)
+            var ufTuning = new DisjointSet(packagesMeta.Length);
+            var tuningCollisions = new List<(TGI_Key Key, List<int> PkgIds)>();
 
             foreach (var (key, packageIds) in resourceMap)
             {
                 if (packageIds.Count <= 1) continue;
-
-                var uniqueIds = packageIds.Distinct().ToList();
-                if (uniqueIds.Count <= 1) continue;
-
-                for (int a = 0; a < uniqueIds.Count; a++)
+                if (Sims3ResourceTags.IsModTuning(key.Type))
                 {
-                    for (int b = a + 1; b < uniqueIds.Count; b++)
+                    tuningCollisions.Add((key, packageIds));
+                    for (int i = 1; i < packageIds.Count; i++)
                     {
-                        int idA = Math.Min(uniqueIds[a], uniqueIds[b]);
-                        int idB = Math.Max(uniqueIds[a], uniqueIds[b]);
-                        string pairKey = $"{idA}:{idB}";
+                        ufTuning.Union(packageIds[0], packageIds[i]);
+                    }
+                }
+            }
 
-                        if (!pairCollisions.TryGetValue(pairKey, out var tuple))
-                        {
-                            tuple = (idA, idB, new List<TGI_Key>());
-                            pairCollisions[pairKey] = tuple;
-                        }
-                        tuple.Keys.Add(key);
+            var tuningClusters = new Dictionary<int, (HashSet<int> PackageIds, HashSet<TGI_Key> Keys)>();
+            foreach (var (key, packageIds) in tuningCollisions)
+            {
+                int root = ufTuning.Find(packageIds[0]);
+                if (!tuningClusters.TryGetValue(root, out var cluster))
+                {
+                    cluster = (new HashSet<int>(), new HashSet<TGI_Key>());
+                    tuningClusters[root] = cluster;
+                }
+                foreach (var pid in packageIds)
+                {
+                    cluster.PackageIds.Add(pid);
+                }
+                cluster.Keys.Add(key);
+            }
+
+            foreach (var (_, cluster) in tuningClusters)
+            {
+                // Skip if this cluster consists entirely of exact duplicates already handled
+                if (cluster.PackageIds.All(pid => handledDuplicatePackageIds.Contains(pid)) &&
+                    cluster.PackageIds.Select(pid => packagesMeta[pid].ContentChecksum).Distinct().Count() == 1)
+                {
+                    continue;
+                }
+
+                incompCount++;
+                var clusterPkgs = cluster.PackageIds.Select(pid => packagesMeta[pid]).OrderBy(p => p.FileName).ToList();
+                bool isIntraSet = clusterPkgs.Select(p => p.SetName).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 1;
+                string setName = clusterPkgs[0].SetName;
+
+                var distinctTuningNames = cluster.Keys
+                    .Select(k => Sims3ResourceTags.GetFriendlyName(k.Type))
+                    .Distinct()
+                    .ToList();
+                string tuningSummary = string.Join(", ", distinctTuningNames);
+
+                var pkgItems = clusterPkgs.Select(p => new PackageConflictItem
+                {
+                    PackageFileName = p.FileName,
+                    PackagePath = p.FilePath,
+                    SetName = p.SetName,
+                    SetId = p.SetId,
+                    MetaEntityId = p.MetaEntityId,
+                    PackageType = p.PackageType,
+                    IsEnabled = p.IsEnabled
+                }).ToList();
+
+                ComputeLoadOrderWinners(pkgItems);
+
+                var techLines = cluster.Keys.Select(k =>
+                    $"[{Sims3ResourceTags.GetTag(k.Type)}] {k} ({Sims3ResourceTags.GetFriendlyName(k.Type)})").ToList();
+
+                string fingerprint = $"Incompatible:{string.Join("|", clusterPkgs.Select(x => x.FileName.ToLowerInvariant()).OrderBy(x => x))}";
+
+                cards.Add(new ConflictCardModel
+                {
+                    Category = ConflictCardCategory.Incompatibility,
+                    Title = isIntraSet
+                        ? $"Incompatible Mods ({clusterPkgs.Count} files in '{setName}')"
+                        : $"Incompatible Mods ({clusterPkgs.Count} files colliding)",
+                    Explanation = $"All {clusterPkgs.Count} mods modify {tuningSummary}. Because they alter the same gameplay tuning system, only one mod's changes can take effect in game.",
+                    Recommendation = "Decide which mod's features you prefer and disable the others (or use 'Keep Only This').",
+                    Packages = pkgItems,
+                    AffectedResourceCount = cluster.Keys.Count,
+                    AffectedSummary = tuningSummary,
+                    IsIntraSet = isIntraSet,
+                    ConflictFingerprint = fingerprint,
+                    TechnicalDetails = techLines
+                });
+            }
+
+            // Step C: Default Overrides (Connected components of CAS / Objects / Sliders overrides)
+            var ufOverrides = new DisjointSet(packagesMeta.Length);
+            var overrideCollisions = new List<(TGI_Key Key, List<int> PkgIds)>();
+
+            foreach (var (key, packageIds) in resourceMap)
+            {
+                if (packageIds.Count <= 1) continue;
+                if (!Sims3ResourceTags.IsModTuning(key.Type))
+                {
+                    overrideCollisions.Add((key, packageIds));
+                    for (int i = 1; i < packageIds.Count; i++)
+                    {
+                        ufOverrides.Union(packageIds[0], packageIds[i]);
                     }
                 }
             }
 
             resourceMap.Clear();
 
-            // 5. Build Simple Actionable Cards
-            var cards = new List<ConflictCardModel>(corruptCards);
-            int incompCount = 0;
-            int dupeCount = 0;
-            int overrideCount = 0;
-
-            foreach (var (_, (idA, idB, sharedKeys)) in pairCollisions)
+            var overrideClusters = new Dictionary<int, (HashSet<int> PackageIds, HashSet<TGI_Key> Keys)>();
+            foreach (var (key, packageIds) in overrideCollisions)
             {
-                var pA = packagesMeta[idA];
-                var pB = packagesMeta[idB];
-
-                bool isIntraSet = string.Equals(pA.SetName, pB.SetName, StringComparison.OrdinalIgnoreCase);
-
-                var pkgAItem = new PackageConflictItem
+                int root = ufOverrides.Find(packageIds[0]);
+                if (!overrideClusters.TryGetValue(root, out var cluster))
                 {
-                    PackageFileName = pA.FileName,
-                    PackagePath = pA.FilePath,
-                    SetName = pA.SetName,
-                    SetId = pA.SetId,
-                    MetaEntityId = pA.MetaEntityId,
-                    PackageType = pA.PackageType,
-                    IsEnabled = pA.IsEnabled
-                };
-
-                var pkgBItem = new PackageConflictItem
+                    cluster = (new HashSet<int>(), new HashSet<TGI_Key>());
+                    overrideClusters[root] = cluster;
+                }
+                foreach (var pid in packageIds)
                 {
-                    PackageFileName = pB.FileName,
-                    PackagePath = pB.FilePath,
-                    SetName = pB.SetName,
-                    SetId = pB.SetId,
-                    MetaEntityId = pB.MetaEntityId,
-                    PackageType = pB.PackageType,
-                    IsEnabled = pB.IsEnabled
-                };
+                    cluster.PackageIds.Add(pid);
+                }
+                cluster.Keys.Add(key);
+            }
 
-                // Technical lines for optional expander
-                var techLines = sharedKeys.Select(k =>
-                    $"[{Sims3ResourceTags.GetTag(k.Type)}] {k} ({Sims3ResourceTags.GetFriendlyName(k.Type)})").ToList();
-
-                // Check 1: Exact Duplicate
-                if (pA.ResourceCount == pB.ResourceCount &&
-                    pA.ContentChecksum == pB.ContentChecksum &&
-                    pA.ResourceCount > 0)
+            foreach (var (_, cluster) in overrideClusters)
+            {
+                // Skip if this cluster consists entirely of exact duplicates already handled
+                if (cluster.PackageIds.All(pid => handledDuplicatePackageIds.Contains(pid)) &&
+                    cluster.PackageIds.Select(pid => packagesMeta[pid].ContentChecksum).Distinct().Count() == 1)
                 {
-                    dupeCount++;
-                    cards.Add(new ConflictCardModel
-                    {
-                        Category = ConflictCardCategory.Duplicate,
-                        Title = isIntraSet
-                            ? $"Duplicate Copy inside '{pA.SetName}'"
-                            : $"Duplicate File in '{pA.SetName}' & '{pB.SetName}'",
-                        Explanation = isIntraSet
-                            ? $"'{pA.FileName}' and '{pB.FileName}' in Set '{pA.SetName}' are identical copies of the exact same package."
-                            : $"'{pA.FileName}' (Set: {pA.SetName}) is identical to '{pB.FileName}' (Set: {pB.SetName}).",
-                        Recommendation = "Disable or delete one of the copies to free disk space and avoid duplicate caching.",
-                        PrimaryPackage = pkgAItem,
-                        SecondaryPackage = pkgBItem,
-                        AffectedResourceCount = sharedKeys.Count,
-                        AffectedSummary = $"{sharedKeys.Count} identical resources",
-                        IsIntraSet = isIntraSet,
-                        TechnicalDetails = techLines
-                    });
                     continue;
                 }
 
-                // Check 2: Mod Tuning Incompatibility
-                var tuningKeys = sharedKeys.Where(k => Sims3ResourceTags.IsModTuning(k.Type)).ToList();
-                if (tuningKeys.Count > 0)
-                {
-                    incompCount++;
-                    var distinctTuningNames = tuningKeys.Select(k => Sims3ResourceTags.GetFriendlyName(k.Type)).Distinct().ToList();
-                    string tuningSummary = string.Join(", ", distinctTuningNames);
-
-                    cards.Add(new ConflictCardModel
-                    {
-                        Category = ConflictCardCategory.Incompatibility,
-                        Title = isIntraSet
-                            ? $"Incompatible Mods bundled in Set '{pA.SetName}'"
-                            : $"Incompatible Mods: {pA.FileName} ⚡ {pB.FileName}",
-                        Explanation = $"Both mods modify {tuningSummary}. Because they change the same gameplay system, only one mod's changes will take effect in game.",
-                        Recommendation = "Decide which mod's features you prefer and disable the other.",
-                        PrimaryPackage = pkgAItem,
-                        SecondaryPackage = pkgBItem,
-                        AffectedResourceCount = sharedKeys.Count,
-                        AffectedSummary = tuningSummary,
-                        IsIntraSet = isIntraSet,
-                        TechnicalDetails = techLines
-                    });
-                    continue;
-                }
-
-                // Check 3: Default Overrides (CAS / Objects / Sliders)
-                var overrideKeys = sharedKeys.Where(k => Sims3ResourceTags.IsOverride(k.Type)).ToList();
                 overrideCount++;
+                var clusterPkgs = cluster.PackageIds.Select(pid => packagesMeta[pid]).OrderBy(p => p.FileName).ToList();
+                bool isIntraSet = clusterPkgs.Select(p => p.SetName).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 1;
+                string setName = clusterPkgs[0].SetName;
 
-                var distinctOverrideNames = (overrideKeys.Count > 0 ? overrideKeys : sharedKeys)
+                var distinctOverrideNames = cluster.Keys
                     .Select(k => Sims3ResourceTags.GetFriendlyName(k.Type))
                     .Distinct()
                     .Take(3)
                     .ToList();
                 string overrideSummary = string.Join(", ", distinctOverrideNames);
 
+                var pkgItems = clusterPkgs.Select(p => new PackageConflictItem
+                {
+                    PackageFileName = p.FileName,
+                    PackagePath = p.FilePath,
+                    SetName = p.SetName,
+                    SetId = p.SetId,
+                    MetaEntityId = p.MetaEntityId,
+                    PackageType = p.PackageType,
+                    IsEnabled = p.IsEnabled
+                }).ToList();
+
+                ComputeLoadOrderWinners(pkgItems);
+
+                var techLines = cluster.Keys.Select(k =>
+                    $"[{Sims3ResourceTags.GetTag(k.Type)}] {k} ({Sims3ResourceTags.GetFriendlyName(k.Type)})").ToList();
+
+                string fingerprint = $"Override:{string.Join("|", clusterPkgs.Select(x => x.FileName.ToLowerInvariant()).OrderBy(x => x))}";
+
                 cards.Add(new ConflictCardModel
                 {
                     Category = ConflictCardCategory.DefaultOverride,
                     Title = isIntraSet
-                        ? $"Resource Override in Set '{pA.SetName}'"
-                        : $"Resource Override: {pA.FileName} ⇋ {pB.FileName}",
-                    Explanation = $"Both packages contain the same {overrideSummary}. One file will override the other in game.",
-                    Recommendation = "Usually safe to keep if one is intended to replace or recolor the other.",
-                    PrimaryPackage = pkgAItem,
-                    SecondaryPackage = pkgBItem,
-                    AffectedResourceCount = sharedKeys.Count,
+                        ? $"Resource Override ({clusterPkgs.Count} files in '{setName}')"
+                        : $"Resource Override ({clusterPkgs.Count} files colliding)",
+                    Explanation = $"These packages contain the same {overrideSummary}. The package loaded last will override the earlier ones in game.",
+                    Recommendation = "Usually safe to keep if one is intended to replace or recolor the other (e.g. default skins, eyes, or mesh replacements).",
+                    Packages = pkgItems,
+                    AffectedResourceCount = cluster.Keys.Count,
                     AffectedSummary = overrideSummary,
                     IsIntraSet = isIntraSet,
+                    ConflictFingerprint = fingerprint,
                     TechnicalDetails = techLines
                 });
             }
 
-            // Sort: Corrupt (0) -> Incompatibility (1) -> Duplicate (2) -> DefaultOverride (3)
-            summary.ConflictCards = cards
-                .OrderBy(c => c.Category)
-                .ThenByDescending(c => c.AffectedResourceCount)
-                .ThenBy(c => c.PrimaryPackage.PackageFileName)
+            cards.AddRange(corruptCards);
+            cards = cards
+                .OrderBy(card => card.Category switch
+                {
+                    ConflictCardCategory.CorruptFile => 0,
+                    ConflictCardCategory.Incompatibility => 1,
+                    ConflictCardCategory.Duplicate => 2,
+                    ConflictCardCategory.DefaultOverride => 3,
+                    _ => 4
+                })
+                .ThenBy(card => card.Title)
                 .ToList();
 
+            summary.ConflictCards = cards;
             summary.IncompatibilitiesCount = incompCount;
             summary.DuplicatesCount = dupeCount;
             summary.OverridesCount = overrideCount;
@@ -755,6 +855,51 @@ public class Sims3HealthService
 
             return summary;
         }, cancellationToken);
+    }
+
+        private static void ComputeLoadOrderWinners(List<PackageConflictItem> items)
+    {
+        var enabledItems = items.Where(x => x.IsEnabled).ToList();
+        foreach (var item in items)
+        {
+            item.IsWinningInLoadOrder = false;
+        }
+
+        if (enabledItems.Count == 0) return;
+
+        var winner = enabledItems
+            .OrderByDescending(p => p.PackagePath.Contains("overrides", StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(p => p.PackageFileName, StringComparer.OrdinalIgnoreCase)
+            .First();
+
+        winner.IsWinningInLoadOrder = true;
+    }
+
+    private class DisjointSet
+    {
+        private readonly int[] _parent;
+
+        public DisjointSet(int size)
+        {
+            _parent = new int[size];
+            for (int i = 0; i < size; i++) _parent[i] = i;
+        }
+
+        public int Find(int i)
+        {
+            if (_parent[i] == i) return i;
+            return _parent[i] = Find(_parent[i]);
+        }
+
+        public void Union(int i, int j)
+        {
+            int rootI = Find(i);
+            int rootJ = Find(j);
+            if (rootI != rootJ)
+            {
+                _parent[rootI] = rootJ;
+            }
+        }
     }
 
     #endregion
