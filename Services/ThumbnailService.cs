@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using PlumbobForge.Backend.Configuration;
 using PlumbobForge.Backend.Database;
@@ -43,12 +44,86 @@ public class ThumbnailService
         catch { }
     }
 
+    public async Task<int> CleanupOrphanedThumbnailsAsync()
+    {
+        return await Task.Run(async () =>
+        {
+            try
+            {
+                string thumbDir = GetThumbnailDirectory();
+                if (!Directory.Exists(thumbDir)) return 0;
+
+                var existingItemIds = (await _db.MetaEntities.AsNoTracking().Select(m => m.Id).ToListAsync())
+                    .ToHashSet();
+
+                var files = Directory.GetFiles(thumbDir, "*.*");
+                int removedCount = 0;
+
+                foreach (var file in files)
+                {
+                    var ext = Path.GetExtension(file).ToLowerInvariant();
+                    if (ext != ".thumb" && ext != ".nothumb") continue;
+
+                    var name = Path.GetFileNameWithoutExtension(file);
+                    if (long.TryParse(name, out var id))
+                    {
+                        if (!existingItemIds.Contains(id))
+                        {
+                            try
+                            {
+                                File.Delete(file);
+                                removedCount++;
+                            }
+                            catch { }
+                        }
+                    }
+                }
+
+                return removedCount;
+            }
+            catch (Exception ex)
+            {
+                AppLogger.LogWarning("Failed to clean up orphaned thumbnails", ex, "ThumbnailService");
+                return 0;
+            }
+        });
+    }
+
     private static readonly uint[] ValidThumbTypes = new uint[] {
         0x626F60CC, 0x626F60CD, 0x626F60CE, // Custom thumbnails (highest priority)
         0x2E75C765, 0x2E75C764, 0x2E75C766, // Auto-generated CAS / Object thumbnails
         0x0B202AD9, // THUM
         0x0580A2B4, 0x0580A2B5, 0x0580A2B6 // Other UI thumbnails
     };
+
+    private static ResourceEntry? FindBestThumbnail(DBPFPackage package)
+    {
+        ResourceEntry? best = null;
+        int bestPriority = int.MaxValue;
+
+        foreach (var r in package.Resources)
+        {
+            uint type = r.Key.Type;
+            for (int i = 0; i < ValidThumbTypes.Length; i++)
+            {
+                if (type == ValidThumbTypes[i])
+                {
+                    if (i == 0) // Highest priority found (custom thumbnail) - return immediately!
+                    {
+                        return r;
+                    }
+                    if (i < bestPriority)
+                    {
+                        best = r;
+                        bestPriority = i;
+                    }
+                    break;
+                }
+            }
+        }
+
+        return best;
+    }
 
     public async Task<string?> GetThumbnailPathAsync(long itemId)
     {
@@ -94,10 +169,7 @@ public class ThumbnailService
                 {
                     foreach (var pkg in sims3Pack.Packages)
                     {
-                        var res = ValidThumbTypes
-                            .Select(typeId => pkg.Resources.FirstOrDefault(r => r.Key.Type == typeId))
-                            .FirstOrDefault(r => r != null);
-
+                        var res = FindBestThumbnail(pkg);
                         if (res != null)
                         {
                             var bytes = res.Read();
@@ -110,9 +182,7 @@ public class ThumbnailService
             else
             {
                 using var package = new DBPFPackage(item.CompleteFileName);
-                var res = ValidThumbTypes
-                    .Select(typeId => package.Resources.FirstOrDefault(r => r.Key.Type == typeId))
-                    .FirstOrDefault(r => r != null);
+                var res = FindBestThumbnail(package);
 
                 if (res != null)
                 {
@@ -144,7 +214,7 @@ public class ThumbnailService
             using var original = SKBitmap.Decode(rawBytes);
             if (original != null && original.Width > 0 && original.Height > 0)
             {
-                int maxDim = 512;
+                int maxDim = 256;
                 int targetWidth = original.Width;
                 int targetHeight = original.Height;
 
@@ -166,10 +236,10 @@ public class ThumbnailService
                 using var surface = SKSurface.Create(info);
                 if (surface != null)
                 {
-                    using var paint = new SKPaint { FilterQuality = SKFilterQuality.High };
+                    using var paint = new SKPaint { FilterQuality = SKFilterQuality.Medium };
                     surface.Canvas.DrawBitmap(original, new SKRect(0, 0, targetWidth, targetHeight), paint);
                     using var image = surface.Snapshot();
-                    using var encoded = image.Encode(SKEncodedImageFormat.Jpeg, 92);
+                    using var encoded = image.Encode(SKEncodedImageFormat.Jpeg, 82);
                     if (encoded != null)
                     {
                         using var fs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None, 4096, FileOptions.SequentialScan);
