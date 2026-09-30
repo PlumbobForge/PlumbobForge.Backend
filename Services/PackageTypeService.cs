@@ -94,13 +94,52 @@ public class PackageTypeService
 
             foreach (var package in packages)
             {
-                if (package.Resources.Any(r => r.Key.Type == 107542056)) hasWorldRes = true;
-                if (package.Resources.Any(r => r.Key.Type == 3496170587u)) hasLotRes = true;
-                if (package.Resources.Any(r => r.Key.Type == 83396964)) hasSimRes = true;
-                if (package.Resources.Any(r => r.Key.Type == 0xD4D9FBE5)) hasPatternRes = true;
+                var caspList = new List<S3ForgeTools.GameFiles.Package.ResourceEntry>();
+                bool hasBuildBuyThisPackage = false;
+                bool hasFaceModifier = false;
+                bool hasBlendGeom = false;
+                bool hasTone = false;
+                bool hasPreset1 = false;
 
-                var caspList = package.Resources.Where(r => r.Key.Type == 0x034AEECB).ToList();
-                if (caspList.Any())
+                foreach (var res in package.Resources)
+                {
+                    uint type = res.Key.Type;
+                    switch (type)
+                    {
+                        case 107542056: // World
+                            hasWorldRes = true;
+                            break;
+                        case 3496170587u: // Lot
+                            hasLotRes = true;
+                            break;
+                        case 83396964: // Sim
+                            hasSimRes = true;
+                            break;
+                        case 0xD4D9FBE5: // Pattern
+                            hasPatternRes = true;
+                            break;
+                        case 0x034AEECB: // CASP
+                            caspList.Add(res);
+                            break;
+                        case 0x319E4F1D: // OBJD
+                            hasBuildBuyThisPackage = true;
+                            break;
+                        case 0x0358B08A: // FaceModifier
+                            hasFaceModifier = true;
+                            break;
+                        case 0x0355E0A6: // BlendGeom
+                            hasBlendGeom = true;
+                            break;
+                        case 0x0166038C: // Tone
+                            hasTone = true;
+                            break;
+                        case 0x051DF2DD: // Preset
+                            hasPreset1 = true;
+                            break;
+                    }
+                }
+
+                if (caspList.Count > 0)
                 {
                     hasCaspOverall = true;
                     foreach (var caspEntry in caspList)
@@ -147,17 +186,12 @@ public class PackageTypeService
                 }
                 else
                 {
-                    if (package.Resources.Any(r => r.Key.Type == 0x319E4F1D))
+                    if (hasBuildBuyThisPackage)
                     {
                         isBuildBuy = true;
                     }
                     else
                     {
-                        bool hasFaceModifier = package.Resources.Any(r => r.Key.Type == 0x0358B08A);
-                        bool hasBlendGeom = package.Resources.Any(r => r.Key.Type == 0x0355E0A6);
-                        bool hasTone = package.Resources.Any(r => r.Key.Type == 0x0166038C);
-                        bool hasPreset1 = package.Resources.Any(r => r.Key.Type == 0x051DF2DD);
-
                         if (hasFaceModifier || hasBlendGeom) categories.Add("Sliders");
                         else if (hasTone) categories.Add("Skins");
                         else if (hasPreset1) categories.Add("Presets");

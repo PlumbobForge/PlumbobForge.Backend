@@ -16,6 +16,29 @@ namespace PlumbobForge.Backend.Services;
 
 public class CacheBuilderService
 {
+    private static readonly TGI_Key DollDressedKey = new(832458525u, 0u, 4064452635095512314uL);
+
+    private enum SpecialPackageType
+    {
+        None,
+        World,
+        Lot,
+        Sim,
+        Pattern
+    }
+
+    private static SpecialPackageType DetectSpecialPackageType(DBPFPackage package)
+    {
+        foreach (var res in package.Resources)
+        {
+            uint t = res.Key.Type;
+            if (t == 107542056) return SpecialPackageType.World;
+            if (t == 3496170587u) return SpecialPackageType.Lot;
+            if (t == 83396964) return SpecialPackageType.Sim;
+            if (t == 0xD4D9FBE5) return SpecialPackageType.Pattern;
+        }
+        return SpecialPackageType.None;
+    }
     private readonly AppDbContext _db;
     private readonly IOptionsMonitor<PlumbobForgeOptions> _optionsMonitor;
     private PlumbobForgeOptions _options => _optionsMonitor.CurrentValue;
@@ -197,11 +220,13 @@ public class CacheBuilderService
             }
 
             // Sync SavedSims & Library (Lots) into Documents/Electronic Arts/The Sims 3/
+            // Safely manage ONLY files deployed and tracked by PlumbobForge (never touch unmanaged user/game files)
             string managedNonPkgFile = Path.Combine(_options.DocumentBaseDir, "ManagedNonPackageItems.txt");
             var previouslyManagedNonPkg = File.Exists(managedNonPkgFile)
                 ? File.ReadAllLines(managedNonPkgFile).Where(l => !string.IsNullOrWhiteSpace(l)).ToHashSet(StringComparer.OrdinalIgnoreCase)
                 : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+            // Clean up ONLY items that were previously deployed by PlumbobForge and are no longer in the active configuration
             foreach (var oldFile in previouslyManagedNonPkg)
             {
                 if (!targetFilesToSync.ContainsKey(oldFile))
@@ -519,7 +544,7 @@ public class CacheBuilderService
         DBPFPackageBuilder? outputPkg = null;
         int packageCount = 0;
         var addedTgis = new HashSet<TGI_Key>();
-        var nonPackageItems = new List<string>();
+        var nonPackageItems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         int reportInterval = Math.Max(1, totalItems / 50);
 
@@ -564,32 +589,44 @@ public class CacheBuilderService
                     try
                     {
                         string originalName = Path.GetFileNameWithoutExtension(item.FileName);
-                        if (dbpfPackage.Resources.Any(r => r.Key.Type == 107542056))
+                        var specialType = DetectSpecialPackageType(dbpfPackage);
+                        switch (specialType)
                         {
-                            string path = InstallAsWorld(dbpfPackage, originalName, nonPackageItems);
-                            if (path != null) nonPackageItems.Add(path);
-                        }
-                        else if (dbpfPackage.Resources.Any(r => r.Key.Type == 3496170587u))
-                        {
-                            string path = InstallAsLot(dbpfPackage, originalName, nonPackageItems);
-                            if (path != null) nonPackageItems.Add(path);
-                        }
-                        else if (dbpfPackage.Resources.Any(r => r.Key.Type == 83396964))
-                        {
-                            string path = InstallAsSim(dbpfPackage, originalName, nonPackageItems);
-                            if (path != null) nonPackageItems.Add(path);
-                        }
-                        else if (dbpfPackage.Resources.Any(r => r.Key.Type == 0xD4D9FBE5)) // Pattern (PTRN)
-                        {
-                            InstallAsPattern(dbpfPackage, originalName, staticCacheDir);
-                        }
-                        else if (ValidatePackage(dbpfPackage))
-                        {
-                            RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, dbpfPackage, addedTgis);
-                        }
-                        else
-                        {
-                            SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
+                            case SpecialPackageType.World:
+                            {
+                                string path = InstallAsWorld(dbpfPackage, originalName, nonPackageItems);
+                                if (path != null) nonPackageItems.Add(path);
+                                break;
+                            }
+                            case SpecialPackageType.Lot:
+                            {
+                                string path = InstallAsLot(dbpfPackage, originalName, nonPackageItems);
+                                if (path != null) nonPackageItems.Add(path);
+                                break;
+                            }
+                            case SpecialPackageType.Sim:
+                            {
+                                string path = InstallAsSim(dbpfPackage, originalName, nonPackageItems);
+                                if (path != null) nonPackageItems.Add(path);
+                                break;
+                            }
+                            case SpecialPackageType.Pattern:
+                            {
+                                InstallAsPattern(dbpfPackage, originalName, staticCacheDir);
+                                break;
+                            }
+                            default:
+                            {
+                                if (ValidatePackage(dbpfPackage))
+                                {
+                                    RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, dbpfPackage, addedTgis);
+                                }
+                                else
+                                {
+                                    SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
+                                }
+                                break;
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -609,7 +646,7 @@ public class CacheBuilderService
                     using (Sims3Pack sims3Pack = new Sims3Pack(filePath))
                     {
                         string originalName = Path.GetFileNameWithoutExtension(item.FileName);
-                        var worldPkg = sims3Pack.Packages.FirstOrDefault(p => p.Resources.Any(r => r.Key.Type == 107542056));
+                        var worldPkg = sims3Pack.Packages.FirstOrDefault(p => DetectSpecialPackageType(p) == SpecialPackageType.World);
                         if (worldPkg != null)
                         {
                             string path = InstallAsWorld(worldPkg, originalName, nonPackageItems);
@@ -619,23 +656,34 @@ public class CacheBuilderService
                             {
                                 if (package == worldPkg) continue;
 
-                                if (package.Resources.Any(r => r.Key.Type == 3496170587u))
+                                var pkgType = DetectSpecialPackageType(package);
+                                switch (pkgType)
                                 {
-                                    string lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                    if (lotPath != null) nonPackageItems.Add(lotPath);
-                                }
-                                else if (package.Resources.Any(r => r.Key.Type == 83396964))
-                                {
-                                    string simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                    if (simPath != null) nonPackageItems.Add(simPath);
-                                }
-                                else if (package.Resources.Any(r => r.Key.Type == 0xD4D9FBE5)) // Pattern (PTRN)
-                                {
-                                    InstallAsPattern(package, originalName, staticCacheDir);
-                                }
-                                else if (ValidatePackage(package))
-                                {
-                                    RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, package, addedTgis);
+                                    case SpecialPackageType.Lot:
+                                    {
+                                        string lotPath = InstallAsLot(package, originalName, nonPackageItems);
+                                        if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        break;
+                                    }
+                                    case SpecialPackageType.Sim:
+                                    {
+                                        string simPath = InstallAsSim(package, originalName, nonPackageItems);
+                                        if (simPath != null) nonPackageItems.Add(simPath);
+                                        break;
+                                    }
+                                    case SpecialPackageType.Pattern:
+                                    {
+                                        InstallAsPattern(package, originalName, staticCacheDir);
+                                        break;
+                                    }
+                                    default:
+                                    {
+                                        if (ValidatePackage(package))
+                                        {
+                                            RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, package, addedTgis);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -643,27 +691,38 @@ public class CacheBuilderService
                         {
                             foreach (DBPFPackage package in sims3Pack.Packages)
                             {
-                                if (package.Resources.Any(r => r.Key.Type == 3496170587u))
+                                var pkgType = DetectSpecialPackageType(package);
+                                switch (pkgType)
                                 {
-                                    string lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                    if (lotPath != null) nonPackageItems.Add(lotPath);
-                                }
-                                else if (package.Resources.Any(r => r.Key.Type == 83396964))
-                                {
-                                    string simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                    if (simPath != null) nonPackageItems.Add(simPath);
-                                }
-                                else if (package.Resources.Any(r => r.Key.Type == 0xD4D9FBE5)) // Pattern (PTRN)
-                                {
-                                    InstallAsPattern(package, originalName, staticCacheDir);
-                                }
-                                else if (ValidatePackage(package))
-                                {
-                                    RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, package, addedTgis);
-                                }
-                                else
-                                {
-                                    SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
+                                    case SpecialPackageType.Lot:
+                                    {
+                                        string lotPath = InstallAsLot(package, originalName, nonPackageItems);
+                                        if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        break;
+                                    }
+                                    case SpecialPackageType.Sim:
+                                    {
+                                        string simPath = InstallAsSim(package, originalName, nonPackageItems);
+                                        if (simPath != null) nonPackageItems.Add(simPath);
+                                        break;
+                                    }
+                                    case SpecialPackageType.Pattern:
+                                    {
+                                        InstallAsPattern(package, originalName, staticCacheDir);
+                                        break;
+                                    }
+                                    default:
+                                    {
+                                        if (ValidatePackage(package))
+                                        {
+                                            RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, package, addedTgis);
+                                        }
+                                        else
+                                        {
+                                            SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -839,7 +898,7 @@ public class CacheBuilderService
         DBPFPackageBuilder? outputPkg = null;
         int packageCount = 0;
         var addedTgis = new HashSet<TGI_Key>();
-        var nonPackageItems = new List<string>();
+        var nonPackageItems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         var metaEntities = activeSet.MetaEntities?.ToList() ?? new List<MetaEntity>();
         int totalItems = metaEntities.Count;
@@ -898,33 +957,45 @@ public class CacheBuilderService
                     try
                     {
                         string originalName = Path.GetFileNameWithoutExtension(item.FileName);
-                        if (dbpfPackage.Resources.Any(r => r.Key.Type == 107542056)) // World
+                        var specialType = DetectSpecialPackageType(dbpfPackage);
+                        switch (specialType)
                         {
-                            string path = InstallAsWorld(dbpfPackage, originalName, nonPackageItems);
-                            if (path != null) nonPackageItems.Add(path);
-                        }
-                        else if (dbpfPackage.Resources.Any(r => r.Key.Type == 3496170587u)) // Lot
-                        {
-                            string path = InstallAsLot(dbpfPackage, originalName, nonPackageItems);
-                            if (path != null) nonPackageItems.Add(path);
-                        }
-                        else if (dbpfPackage.Resources.Any(r => r.Key.Type == 83396964)) // Sim
-                        {
-                            string path = InstallAsSim(dbpfPackage, originalName, nonPackageItems);
-                            if (path != null) nonPackageItems.Add(path);
-                        }
-                        else if (dbpfPackage.Resources.Any(r => r.Key.Type == 0xD4D9FBE5)) // Pattern (PTRN)
-                        {
-                            InstallAsPattern(dbpfPackage, originalName, setPath);
-                        }
-                        else if (ValidatePackage(dbpfPackage))
-                        {
-                            RebuildPackage(ref outputPkg, ref packageCount, activeSet, dbpfPackage, addedTgis, allSetsMap);
-                        }
-                        else
-                        {
-                            SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
-                            onProgress?.Invoke(_localizer.GetString("skipping_invalid_package", item.FileName));
+                            case SpecialPackageType.World:
+                            {
+                                string path = InstallAsWorld(dbpfPackage, originalName, nonPackageItems);
+                                if (path != null) nonPackageItems.Add(path);
+                                break;
+                            }
+                            case SpecialPackageType.Lot:
+                            {
+                                string path = InstallAsLot(dbpfPackage, originalName, nonPackageItems);
+                                if (path != null) nonPackageItems.Add(path);
+                                break;
+                            }
+                            case SpecialPackageType.Sim:
+                            {
+                                string path = InstallAsSim(dbpfPackage, originalName, nonPackageItems);
+                                if (path != null) nonPackageItems.Add(path);
+                                break;
+                            }
+                            case SpecialPackageType.Pattern:
+                            {
+                                InstallAsPattern(dbpfPackage, originalName, setPath);
+                                break;
+                            }
+                            default:
+                            {
+                                if (ValidatePackage(dbpfPackage))
+                                {
+                                    RebuildPackage(ref outputPkg, ref packageCount, activeSet, dbpfPackage, addedTgis, allSetsMap);
+                                }
+                                else
+                                {
+                                    SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
+                                    onProgress?.Invoke(_localizer.GetString("skipping_invalid_package", item.FileName));
+                                }
+                                break;
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -945,7 +1016,7 @@ public class CacheBuilderService
                     using (Sims3Pack sims3Pack = new Sims3Pack(filePath))
                     {
                         string originalName = Path.GetFileNameWithoutExtension(item.FileName);
-                        var worldPkg = sims3Pack.Packages.FirstOrDefault(p => p.Resources.Any(r => r.Key.Type == 107542056));
+                        var worldPkg = sims3Pack.Packages.FirstOrDefault(p => DetectSpecialPackageType(p) == SpecialPackageType.World);
                         if (worldPkg != null)
                         {
                             string path = InstallAsWorld(worldPkg, originalName, nonPackageItems);
@@ -955,23 +1026,34 @@ public class CacheBuilderService
                             {
                                 if (package == worldPkg) continue;
 
-                                if (package.Resources.Any(r => r.Key.Type == 3496170587u)) // Lot
+                                var pkgType = DetectSpecialPackageType(package);
+                                switch (pkgType)
                                 {
-                                    string lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                    if (lotPath != null) nonPackageItems.Add(lotPath);
-                                }
-                                else if (package.Resources.Any(r => r.Key.Type == 83396964)) // Sim
-                                {
-                                    string simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                    if (simPath != null) nonPackageItems.Add(simPath);
-                                }
-                                else if (package.Resources.Any(r => r.Key.Type == 0xD4D9FBE5)) // Pattern (PTRN)
-                                {
-                                    InstallAsPattern(package, originalName, setPath);
-                                }
-                                else if (ValidatePackage(package))
-                                {
-                                    RebuildPackage(ref outputPkg, ref packageCount, activeSet, package, addedTgis, allSetsMap);
+                                    case SpecialPackageType.Lot:
+                                    {
+                                        string lotPath = InstallAsLot(package, originalName, nonPackageItems);
+                                        if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        break;
+                                    }
+                                    case SpecialPackageType.Sim:
+                                    {
+                                        string simPath = InstallAsSim(package, originalName, nonPackageItems);
+                                        if (simPath != null) nonPackageItems.Add(simPath);
+                                        break;
+                                    }
+                                    case SpecialPackageType.Pattern:
+                                    {
+                                        InstallAsPattern(package, originalName, setPath);
+                                        break;
+                                    }
+                                    default:
+                                    {
+                                        if (ValidatePackage(package))
+                                        {
+                                            RebuildPackage(ref outputPkg, ref packageCount, activeSet, package, addedTgis, allSetsMap);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -979,28 +1061,39 @@ public class CacheBuilderService
                         {
                             foreach (DBPFPackage package in sims3Pack.Packages)
                             {
-                                if (package.Resources.Any(r => r.Key.Type == 3496170587u)) // Lot
+                                var pkgType = DetectSpecialPackageType(package);
+                                switch (pkgType)
                                 {
-                                    string lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                    if (lotPath != null) nonPackageItems.Add(lotPath);
-                                }
-                                else if (package.Resources.Any(r => r.Key.Type == 83396964)) // Sim
-                                {
-                                    string simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                    if (simPath != null) nonPackageItems.Add(simPath);
-                                }
-                                else if (package.Resources.Any(r => r.Key.Type == 0xD4D9FBE5)) // Pattern (PTRN)
-                                {
-                                    InstallAsPattern(package, originalName, setPath);
-                                }
-                                else if (ValidatePackage(package))
-                                {
-                                    RebuildPackage(ref outputPkg, ref packageCount, activeSet, package, addedTgis, allSetsMap);
-                                }
-                                else
-                                {
-                                    SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
-                                    onProgress?.Invoke(_localizer.GetString("skipping_invalid_package_sims3pack", item.FileName));
+                                    case SpecialPackageType.Lot:
+                                    {
+                                        string lotPath = InstallAsLot(package, originalName, nonPackageItems);
+                                        if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        break;
+                                    }
+                                    case SpecialPackageType.Sim:
+                                    {
+                                        string simPath = InstallAsSim(package, originalName, nonPackageItems);
+                                        if (simPath != null) nonPackageItems.Add(simPath);
+                                        break;
+                                    }
+                                    case SpecialPackageType.Pattern:
+                                    {
+                                        InstallAsPattern(package, originalName, setPath);
+                                        break;
+                                    }
+                                    default:
+                                    {
+                                        if (ValidatePackage(package))
+                                        {
+                                            RebuildPackage(ref outputPkg, ref packageCount, activeSet, package, addedTgis, allSetsMap);
+                                        }
+                                        else
+                                        {
+                                            SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
+                                            onProgress?.Invoke(_localizer.GetString("skipping_invalid_package_sims3pack", item.FileName));
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -1131,7 +1224,7 @@ public class CacheBuilderService
         return Path.Combine(GetSims3FolderPath(), subFolder, fileName);
     }
 
-    private string InstallAsSim(DBPFPackage package, string name, List<string> nonPackageItems)
+    private string InstallAsSim(DBPFPackage package, string name, ISet<string> nonPackageItems)
     {
         string basePath = Path.ChangeExtension(Path.Combine(_options.DocumentBaseDir, "Sims", name), ".sim");
         string path = basePath;
@@ -1146,7 +1239,7 @@ public class CacheBuilderService
         return path;
     }
 
-    private string InstallAsLot(DBPFPackage package, string name, List<string> nonPackageItems)
+    private string InstallAsLot(DBPFPackage package, string name, ISet<string> nonPackageItems)
     {
         string basePath = Path.ChangeExtension(Path.Combine(_options.DocumentBaseDir, "Lots", name), ".package");
         string path = basePath;
@@ -1193,7 +1286,7 @@ public class CacheBuilderService
         return new string(fallback.Where(c => !invalid.Contains(c) && c != '/' && c != '\\').ToArray()).Trim();
     }
 
-    private string InstallAsWorld(DBPFPackage package, string defaultName, List<string> nonPackageItems)
+    private string InstallAsWorld(DBPFPackage package, string defaultName, ISet<string> nonPackageItems)
     {
         string worldName = GetWorldName(package, defaultName);
         string worldsDir = Path.Combine(_options.DocumentBaseDir, "Worlds");
@@ -1229,12 +1322,11 @@ public class CacheBuilderService
         return path;
     }
 
-    private bool ValidatePackage(DBPFPackage package)
+    private static bool ValidatePackage(DBPFPackage package)
     {
-        var dollDressedKey = new TGI_Key(832458525u, 0u, 4064452635095512314uL);
         foreach (var resource in package.Resources)
         {
-            if (resource.Key.Type == dollDressedKey.Type && resource.Key.Group == dollDressedKey.Group && resource.Key.Instance == dollDressedKey.Instance)
+            if (resource.Key.Type == DollDressedKey.Type && resource.Key.Group == DollDressedKey.Group && resource.Key.Instance == DollDressedKey.Instance)
             {
                 return false;
             }
@@ -1368,7 +1460,7 @@ public class CacheBuilderService
             {
                 using var sw = new StreamWriter(mainResourceCfg, false);
                 sw.WriteLine("Priority 500");
-                sw.WriteLine("PackedFile Cache/Config/Resource.cfg");
+                sw.WriteLine("Scan Cache/Config/");
                 sw.WriteLine("PackedFile Packages/*.package");
                 sw.WriteLine("PackedFile Packages/*/*.package");
                 sw.WriteLine("PackedFile Packages/*/*/*.package");
@@ -1382,9 +1474,34 @@ public class CacheBuilderService
             try
             {
                 string content = File.ReadAllText(mainResourceCfg);
-                if (!content.Contains("PackedFile Cache/Config/Resource.cfg", StringComparison.OrdinalIgnoreCase))
+                var lines = content.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None).ToList();
+                bool modified = false;
+
+                // 1. Remove any erroneous "PackedFile ... Resource.cfg" entries that cause TS3 to treat
+                // a text config file as a DBPF package archive, producing disk stalls and engine lag.
+                for (int i = lines.Count - 1; i >= 0; i--)
                 {
-                    var lines = content.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None).ToList();
+                    string trimmed = lines[i].Trim();
+                    if (trimmed.StartsWith("PackedFile", StringComparison.OrdinalIgnoreCase) &&
+                        trimmed.Contains("Resource.cfg", StringComparison.OrdinalIgnoreCase))
+                    {
+                        lines.RemoveAt(i);
+                        modified = true;
+                    }
+                }
+
+                // 2. Ensure "Scan Cache/Config/" directive exists (relative or absolute) so the game
+                // engine properly includes the secondary Resource.cfg generated by PlumbobForge / CC Magic.
+                bool hasScan = lines.Any(l =>
+                {
+                    string trimmed = l.Trim();
+                    return trimmed.StartsWith("Scan", StringComparison.OrdinalIgnoreCase) &&
+                           (trimmed.Contains("Cache/Config", StringComparison.OrdinalIgnoreCase) ||
+                            trimmed.Contains(@"Cache\Config", StringComparison.OrdinalIgnoreCase));
+                });
+
+                if (!hasScan)
+                {
                     int insertIndex = 0;
                     for (int i = 0; i < lines.Count; i++)
                     {
@@ -1394,7 +1511,12 @@ public class CacheBuilderService
                             break;
                         }
                     }
-                    lines.Insert(insertIndex, "PackedFile Cache/Config/Resource.cfg");
+                    lines.Insert(insertIndex, "Scan Cache/Config/");
+                    modified = true;
+                }
+
+                if (modified)
+                {
                     File.WriteAllText(mainResourceCfg, string.Join(Environment.NewLine, lines));
                 }
             }

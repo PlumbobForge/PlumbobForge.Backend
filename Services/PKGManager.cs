@@ -193,24 +193,35 @@ public class PKGManager
     public async Task<List<MetaEntity>> RegisterSpecificFilesAsync(IEnumerable<string> filePaths, long? targetSetId = null)
     {
         var result = new List<MetaEntity>();
+        var validFilePaths = filePaths.Where(File.Exists).ToList();
+        if (validFilePaths.Count == 0) return result;
+
         var setEntities = await _db.SetsEntities.ToListAsync();
+        var setEntitiesById = setEntities.ToDictionary(s => s.Id);
         SetsEntity assignSet;
-        if (targetSetId.HasValue)
+        if (targetSetId.HasValue && setEntitiesById.TryGetValue(targetSetId.Value, out var requestedSet))
         {
-            var requestedSet = setEntities.FirstOrDefault(s => s.Id == targetSetId.Value);
-            assignSet = requestedSet ?? setEntities.FirstOrDefault(s => s.Name == "Default") ?? setEntities.First();
+            assignSet = requestedSet;
         }
         else
         {
             assignSet = setEntities.FirstOrDefault(s => s.Name == "Default") ?? setEntities.First();
         }
 
-        foreach (var filePath in filePaths)
-        {
-            if (!File.Exists(filePath)) continue;
+        var fileNames = validFilePaths.Select(Path.GetFileName).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var existingMetas = await _db.MetaEntities
+            .Include(m => m.SetsEntity)
+            .Where(m => fileNames.Contains(m.FileName))
+            .ToDictionaryAsync(m => m.FileName, StringComparer.OrdinalIgnoreCase);
 
+        var tombstones = await _db.Tombstones
+            .Where(t => fileNames.Contains(t.FileName))
+            .ToDictionaryAsync(t => t.FileName, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var filePath in validFilePaths)
+        {
             string fileName = Path.GetFileName(filePath);
-            var existingMeta = await _db.MetaEntities.FirstOrDefaultAsync(m => m.FileName == fileName);
+            existingMetas.TryGetValue(fileName, out var existingMeta);
             var fileInfo = new FileInfo(filePath);
             double currentSizeKb = fileInfo.Length / 1024.0;
             bool isSims3Pack = Path.GetExtension(fileName).Equals(".sims3pack", StringComparison.OrdinalIgnoreCase);
@@ -237,9 +248,9 @@ public class PKGManager
                 }
                 catch { }
 
-                var tombstone = await _db.Tombstones.FirstOrDefaultAsync(t => t.FileName == fileName);
-                var targetSet = (tombstone != null && tombstone.SetsEntityId.HasValue && setEntities.Any(s => s.Id == tombstone.SetsEntityId.Value))
-                    ? setEntities.First(s => s.Id == tombstone.SetsEntityId.Value)
+                tombstones.TryGetValue(fileName, out var tombstone);
+                var targetSet = (tombstone != null && tombstone.SetsEntityId.HasValue && setEntitiesById.TryGetValue(tombstone.SetsEntityId.Value, out var setFromTombstone))
+                    ? setFromTombstone
                     : assignSet;
 
                 var meta = new MetaEntity
@@ -254,6 +265,7 @@ public class PKGManager
                     IsUserTagged = tombstone != null ? tombstone.IsUserTagged : false,
                     UserTags = tombstone != null ? tombstone.UserTags : null,
                     Description = tombstone?.Description ?? string.Empty,
+                    IsFavorite = tombstone != null && tombstone.IsFavorite,
                     CompleteFileName = filePath,
                     SetsEntity = targetSet,
                     InstallDate = DateTime.Now.ToString(),
@@ -265,10 +277,12 @@ public class PKGManager
                 if (tombstone != null)
                 {
                     _db.Tombstones.Remove(tombstone);
+                    tombstones.Remove(fileName);
                 }
 
                 targetSet.Dirty = true;
                 _db.MetaEntities.Add(meta);
+                existingMetas[fileName] = meta;
                 result.Add(meta);
             }
             else
@@ -676,6 +690,7 @@ public class PKGManager
                     IsUserTagged = tombstone != null ? tombstone.IsUserTagged : false,
                     UserTags = tombstone != null ? tombstone.UserTags : null,
                     Description = tombstone?.Description ?? string.Empty,
+                    IsFavorite = tombstone != null && tombstone.IsFavorite,
                     CompleteFileName = filePath,
                     SetsEntity = targetSet,
                     InstallDate = DateTime.Now.ToString(),
