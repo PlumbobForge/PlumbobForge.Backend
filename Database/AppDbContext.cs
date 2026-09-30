@@ -46,6 +46,9 @@ public class AppDbContext : DbContext
             .HasIndex(m => m.Enabled);
 
         modelBuilder.Entity<MetaEntity>()
+            .HasIndex(m => m.IsFavorite);
+
+        modelBuilder.Entity<MetaEntity>()
             .HasIndex(m => m.PackageType);
 
         modelBuilder.Entity<MetaEntity>()

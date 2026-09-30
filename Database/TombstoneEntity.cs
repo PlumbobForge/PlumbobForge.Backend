@@ -14,6 +14,7 @@ public class TombstoneEntity
     public bool IsUserTagged { get; set; } = false;
     public string? UserTags { get; set; }
     public string? Description { get; set; }
+    public bool IsFavorite { get; set; } = false;
     public long? SetsEntityId { get; set; }
     public DateTime DeletedAt { get; set; } = DateTime.UtcNow;
 }

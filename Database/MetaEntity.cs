@@ -13,6 +13,7 @@ public class MetaEntity
     [Required] public string Filehash { get; set; } = string.Empty;
     public string? Description { get; set; }
     public bool Enabled { get; set; } = true;
+    public bool IsFavorite { get; set; } = false;
     public string? URL { get; set; }
     [Required] public string PackageType { get; set; } = string.Empty;
     public string? ResourceID { get; set; }
