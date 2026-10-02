@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Xml;
 using Microsoft.EntityFrameworkCore;
@@ -17,6 +19,7 @@ namespace PlumbobForge.Backend.Services;
 public class CacheBuilderService
 {
     private static readonly TGI_Key DollDressedKey = new(832458525u, 0u, 4064452635095512314uL);
+    private static readonly byte[] ColonSpaceBytes = [(byte)':', (byte)' '];
 
     private enum SpecialPackageType
     {
@@ -39,6 +42,61 @@ public class CacheBuilderService
         }
         return SpecialPackageType.None;
     }
+
+    private static int GetPackageTypePriority(string? packageType)
+    {
+        if (string.IsNullOrEmpty(packageType)) return 4;
+        // Group CAS items together first so StaticBundle_0 holds CAS items for fast CAS loading
+        if (packageType.Equals("CAS", StringComparison.OrdinalIgnoreCase) ||
+            packageType.Equals("Hair", StringComparison.OrdinalIgnoreCase) ||
+            packageType.Equals("Clothing", StringComparison.OrdinalIgnoreCase) ||
+            packageType.Equals("Accessories", StringComparison.OrdinalIgnoreCase) ||
+            packageType.Equals("Details", StringComparison.OrdinalIgnoreCase) ||
+            packageType.Equals("Skin", StringComparison.OrdinalIgnoreCase) ||
+            packageType.Equals("Skins", StringComparison.OrdinalIgnoreCase) ||
+            packageType.Equals("Sliders", StringComparison.OrdinalIgnoreCase) ||
+            packageType.Equals("Presets", StringComparison.OrdinalIgnoreCase))
+        {
+            return 1;
+        }
+
+        // Group Build/Buy objects together second
+        if (packageType.Equals("BuildBuy", StringComparison.OrdinalIgnoreCase) ||
+            packageType.Equals("Object", StringComparison.OrdinalIgnoreCase) ||
+            packageType.Equals("Objects", StringComparison.OrdinalIgnoreCase))
+        {
+            return 2;
+        }
+
+        // Patterns
+        if (packageType.Equals("Pattern", StringComparison.OrdinalIgnoreCase))
+        {
+            return 3;
+        }
+
+        return 4;
+    }
+
+    private static bool ShouldCompressResource(ResourceEntry r, int compressionLevel)
+    {
+        if (r.IsCompressed || r.Length < 64) return false;
+
+        // Skip textures (_IMG: 0x00B2D882) and audio (AUDO: 0x01EEF63A) at low/balanced compression (level <= 2).
+        // They are already internally compressed (DXT1/3/5, MP3/XAS). Compressing them with RefPack
+        // wastes significant CPU during cache builds and causes in-game CAS/Buy Mode loading stutter.
+        // At level >= 3 (High/Max), compress everything as requested by user.
+        if (compressionLevel <= 2)
+        {
+            uint type = r.Key.Type;
+            if (type == 0x00B2D882u || type == 0x01EEF63Au)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private readonly AppDbContext _db;
     private readonly IOptionsMonitor<PlumbobForgeOptions> _optionsMonitor;
     private PlumbobForgeOptions _options => _optionsMonitor.CurrentValue;
@@ -106,9 +164,6 @@ public class CacheBuilderService
                     sw.WriteLine("Priority 500");
                     sw.WriteLine("PackedFile \"../StaticCache/*.package\"");
                     sw.WriteLine("PackedFile \"../StaticCache/*/*.package\"");
-                    sw.WriteLine("PackedFile \"../StaticCache/*/*/*.package\"");
-                    sw.WriteLine("PackedFile \"../StaticCache/*/*/*/*.package\"");
-                    sw.WriteLine("PackedFile \"../StaticCache/*/*/*/*/*.package\"");
                 }
 
                 // In Static mode: Clean up old dynamic set folders from Mods/Cache/ (keep only Config and StaticCache)
@@ -177,9 +232,6 @@ public class CacheBuilderService
                                 string folderName = GetSetFolderName(cs.SetsEntity, allSetsMap);
                                 sw.WriteLine($"PackedFile \"../{folderName}/*.package\"");
                                 sw.WriteLine($"PackedFile \"../{folderName}/*/*.package\"");
-                                sw.WriteLine($"PackedFile \"../{folderName}/*/*/*.package\"");
-                                sw.WriteLine($"PackedFile \"../{folderName}/*/*/*/*.package\"");
-                                sw.WriteLine($"PackedFile \"../{folderName}/*/*/*/*/*.package\"");
 
                                 string sourceSetCacheDir = GetSetPath(cs.SetsEntity, allSetsMap);
                                 if (Directory.Exists(sourceSetCacheDir))
@@ -202,7 +254,6 @@ public class CacheBuilderService
                     }
                 }
             }
-
             else
             {
                 string nonPackageFile = Path.Combine(staticCacheDir, "NonPackageItems.txt");
@@ -412,7 +463,7 @@ public class CacheBuilderService
 
         if (setsToRebuild.Count > 1)
         {
-            var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount / 2, 1, 4) };
+            var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1) };
             Parallel.ForEach(setsToRebuild, parallelOptions, set =>
             {
                 int index = Interlocked.Increment(ref current);
@@ -428,7 +479,7 @@ public class CacheBuilderService
 
                 try
                 {
-                    RebuildSet(set, onProgress, skippedFiles, shouldReport ? progress : null, shouldReport ? stepId : null, itemCount, allSetsMap);
+                    RebuildSet(set, onProgress, skippedFiles, shouldReport ? progress : null, shouldReport ? stepId : null, itemCount, allSetsMap, isParallelSet: true);
                     set.CachedHash = SetDirtyTracker.ComputeContentHash(set);
                     set.Dirty = false;
                     if (shouldReport)
@@ -463,7 +514,7 @@ public class CacheBuilderService
 
                 try
                 {
-                    RebuildSet(set, onProgress, skippedFiles, shouldReport ? progress : null, shouldReport ? stepId : null, itemCount, allSetsMap);
+                    RebuildSet(set, onProgress, skippedFiles, shouldReport ? progress : null, shouldReport ? stepId : null, itemCount, allSetsMap, isParallelSet: false);
                     set.CachedHash = SetDirtyTracker.ComputeContentHash(set);
                     set.Dirty = false;
                     if (shouldReport)
@@ -531,11 +582,15 @@ public class CacheBuilderService
                 .ToListAsync();
         }
 
+        // Sort items by PackageType category so that CAS items, BuildBuy items, etc., are clustered into contiguous bundles
         var allMetaItems = activeSets
             .SelectMany(s => s.MetaEntities ?? new List<MetaEntity>())
             .Where(m => m.Enabled)
             .GroupBy(m => m.FileName, StringComparer.OrdinalIgnoreCase)
             .Select(g => g.First())
+            .OrderBy(m => GetPackageTypePriority(m.PackageType))
+            .ThenBy(m => m.PackageType)
+            .ThenBy(m => m.FileName)
             .ToList();
 
         int totalItems = allMetaItems.Count;
@@ -547,16 +602,23 @@ public class CacheBuilderService
         var nonPackageItems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         int reportInterval = Math.Max(1, totalItems / 50);
+        object outputLock = new();
+        object nonPkgLock = new();
 
-        foreach (var item in allMetaItems)
+        var parallelOptions = new ParallelOptions
         {
-            currentItem++;
-            if (currentItem % reportInterval == 0 || currentItem == totalItems)
+            MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1)
+        };
+
+        Parallel.ForEach(Partitioner.Create(allMetaItems, EnumerablePartitionerOptions.NoBuffering), parallelOptions, item =>
+        {
+            int current = Interlocked.Increment(ref currentItem);
+            if (current % reportInterval == 0 || current == totalItems)
             {
-                double pct = totalItems > 0 ? (double)currentItem / totalItems : 1.0;
-                string badge = $"{currentItem}/{totalItems}";
+                double pct = totalItems > 0 ? (double)current / totalItems : 1.0;
+                string badge = $"{current}/{totalItems}";
                 progress?.UpdateStep(staticStepId, progress: pct, badge: badge);
-                onProgress?.Invoke(_localizer.GetString("merging_item", currentItem, totalItems, "StaticCache"));
+                onProgress?.Invoke(_localizer.GetString("merging_item", current, totalItems, "StaticCache"));
             }
 
             string filePath = item.CompleteFileName;
@@ -570,7 +632,7 @@ public class CacheBuilderService
                 else
                 {
                     SafeAddSkippedFile(skippedFiles, item.FileName, "File not found on disk");
-                    continue;
+                    return;
                 }
             }
 
@@ -581,7 +643,7 @@ public class CacheBuilderService
                 catch (Exception ex)
                 {
                     SafeAddSkippedFile(skippedFiles, item.FileName, ex.Message);
-                    continue;
+                    return;
                 }
 
                 if (dbpfPackage != null)
@@ -594,32 +656,48 @@ public class CacheBuilderService
                         {
                             case SpecialPackageType.World:
                             {
-                                string path = InstallAsWorld(dbpfPackage, originalName, nonPackageItems);
-                                if (path != null) nonPackageItems.Add(path);
+                                lock (nonPkgLock)
+                                {
+                                    string? path = InstallAsWorld(dbpfPackage, originalName, nonPackageItems);
+                                    if (path != null) nonPackageItems.Add(path);
+                                }
                                 break;
                             }
                             case SpecialPackageType.Lot:
                             {
-                                string path = InstallAsLot(dbpfPackage, originalName, nonPackageItems);
-                                if (path != null) nonPackageItems.Add(path);
+                                lock (nonPkgLock)
+                                {
+                                    string? path = InstallAsLot(dbpfPackage, originalName, nonPackageItems);
+                                    if (path != null) nonPackageItems.Add(path);
+                                }
                                 break;
                             }
                             case SpecialPackageType.Sim:
                             {
-                                string path = InstallAsSim(dbpfPackage, originalName, nonPackageItems);
-                                if (path != null) nonPackageItems.Add(path);
+                                lock (nonPkgLock)
+                                {
+                                    string? path = InstallAsSim(dbpfPackage, originalName, nonPackageItems);
+                                    if (path != null) nonPackageItems.Add(path);
+                                }
                                 break;
                             }
                             case SpecialPackageType.Pattern:
                             {
-                                InstallAsPattern(dbpfPackage, originalName, staticCacheDir);
+                                lock (nonPkgLock)
+                                {
+                                    InstallAsPattern(dbpfPackage, originalName, staticCacheDir);
+                                }
                                 break;
                             }
                             default:
                             {
                                 if (ValidatePackage(dbpfPackage))
                                 {
-                                    RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, dbpfPackage, addedTgis);
+                                    PreparePackageResources(dbpfPackage);
+                                    lock (outputLock)
+                                    {
+                                        RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, dbpfPackage, addedTgis, prePrepared: true);
+                                    }
                                 }
                                 else
                                 {
@@ -649,8 +727,11 @@ public class CacheBuilderService
                         var worldPkg = sims3Pack.Packages.FirstOrDefault(p => DetectSpecialPackageType(p) == SpecialPackageType.World);
                         if (worldPkg != null)
                         {
-                            string path = InstallAsWorld(worldPkg, originalName, nonPackageItems);
-                            if (path != null) nonPackageItems.Add(path);
+                            lock (nonPkgLock)
+                            {
+                                string? path = InstallAsWorld(worldPkg, originalName, nonPackageItems);
+                                if (path != null) nonPackageItems.Add(path);
+                            }
 
                             foreach (DBPFPackage package in sims3Pack.Packages)
                             {
@@ -661,26 +742,39 @@ public class CacheBuilderService
                                 {
                                     case SpecialPackageType.Lot:
                                     {
-                                        string lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                        if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        lock (nonPkgLock)
+                                        {
+                                            string? lotPath = InstallAsLot(package, originalName, nonPackageItems);
+                                            if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        }
                                         break;
                                     }
                                     case SpecialPackageType.Sim:
                                     {
-                                        string simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                        if (simPath != null) nonPackageItems.Add(simPath);
+                                        lock (nonPkgLock)
+                                        {
+                                            string? simPath = InstallAsSim(package, originalName, nonPackageItems);
+                                            if (simPath != null) nonPackageItems.Add(simPath);
+                                        }
                                         break;
                                     }
                                     case SpecialPackageType.Pattern:
                                     {
-                                        InstallAsPattern(package, originalName, staticCacheDir);
+                                        lock (nonPkgLock)
+                                        {
+                                            InstallAsPattern(package, originalName, staticCacheDir);
+                                        }
                                         break;
                                     }
                                     default:
                                     {
                                         if (ValidatePackage(package))
                                         {
-                                            RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, package, addedTgis);
+                                            PreparePackageResources(package);
+                                            lock (outputLock)
+                                            {
+                                                RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, package, addedTgis, prePrepared: true);
+                                            }
                                         }
                                         break;
                                     }
@@ -696,26 +790,39 @@ public class CacheBuilderService
                                 {
                                     case SpecialPackageType.Lot:
                                     {
-                                        string lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                        if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        lock (nonPkgLock)
+                                        {
+                                            string? lotPath = InstallAsLot(package, originalName, nonPackageItems);
+                                            if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        }
                                         break;
                                     }
                                     case SpecialPackageType.Sim:
                                     {
-                                        string simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                        if (simPath != null) nonPackageItems.Add(simPath);
+                                        lock (nonPkgLock)
+                                        {
+                                            string? simPath = InstallAsSim(package, originalName, nonPackageItems);
+                                            if (simPath != null) nonPackageItems.Add(simPath);
+                                        }
                                         break;
                                     }
                                     case SpecialPackageType.Pattern:
                                     {
-                                        InstallAsPattern(package, originalName, staticCacheDir);
+                                        lock (nonPkgLock)
+                                        {
+                                            InstallAsPattern(package, originalName, staticCacheDir);
+                                        }
                                         break;
                                     }
                                     default:
                                     {
                                         if (ValidatePackage(package))
                                         {
-                                            RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, package, addedTgis);
+                                            PreparePackageResources(package);
+                                            lock (outputLock)
+                                            {
+                                                RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, package, addedTgis, prePrepared: true);
+                                            }
                                         }
                                         else
                                         {
@@ -733,7 +840,7 @@ public class CacheBuilderService
                     SafeAddSkippedFile(skippedFiles, item.FileName, ex.Message);
                 }
             }
-        }
+        });
 
         if (outputPkg != null)
         {
@@ -888,7 +995,15 @@ public class CacheBuilderService
         return Path.Combine(_options.SetCacheFolderPath, "Sets", folderName);
     }
 
-    public void RebuildSet(SetsEntity activeSet, Action<string>? onProgress = null, List<(string FileName, string Reason)>? skippedFiles = null, ITaskProgressReporter? progress = null, string? stepId = null, int totalCount = 0, Dictionary<long, SetsEntity>? allSetsMap = null)
+    public void RebuildSet(
+        SetsEntity activeSet,
+        Action<string>? onProgress = null,
+        List<(string FileName, string Reason)>? skippedFiles = null,
+        ITaskProgressReporter? progress = null,
+        string? stepId = null,
+        int totalCount = 0,
+        Dictionary<long, SetsEntity>? allSetsMap = null,
+        bool isParallelSet = false)
     {
         if (activeSet.IsLegacy) return;
 
@@ -900,26 +1015,33 @@ public class CacheBuilderService
         var addedTgis = new HashSet<TGI_Key>();
         var nonPackageItems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        var metaEntities = activeSet.MetaEntities?.ToList() ?? new List<MetaEntity>();
+        var metaEntities = activeSet.MetaEntities?.Where(m => m.Enabled).ToList() ?? new List<MetaEntity>();
         int totalItems = metaEntities.Count;
         int currentItem = 0;
         int reportInterval = Math.Max(1, totalItems / 50);
 
-        foreach (var item in metaEntities)
+        object outputLock = new();
+        object nonPkgLock = new();
+
+        // If multiple sets are already running concurrently, process items inside this set sequentially
+        // to prevent thread oversubscription. If only this single set is running and it has many items,
+        // process items using all CPU cores in parallel.
+        bool runItemsInParallel = !isParallelSet && totalItems > 10;
+
+        void ProcessItem(MetaEntity item)
         {
-            currentItem++;
-            bool isLast = currentItem == totalItems;
-            if (currentItem % reportInterval == 0 || isLast)
+            int current = Interlocked.Increment(ref currentItem);
+            bool isLast = current == totalItems;
+            if (current % reportInterval == 0 || isLast)
             {
-                double pct = totalItems > 0 ? (double)currentItem / totalItems : 1.0;
-                string badge = $"{currentItem}/{totalItems}";
+                double pct = totalItems > 0 ? (double)current / totalItems : 1.0;
+                string badge = $"{current}/{totalItems}";
                 if (stepId != null)
                 {
                     progress?.UpdateStep(stepId, progress: pct, badge: badge);
                 }
-                onProgress?.Invoke(_localizer.GetString("merging_item", currentItem, totalItems, activeSet.Name));
+                onProgress?.Invoke(_localizer.GetString("merging_item", current, totalItems, activeSet.Name));
             }
-            if (!item.Enabled) continue;
 
             string filePath = item.CompleteFileName;
             if (!File.Exists(filePath))
@@ -934,7 +1056,7 @@ public class CacheBuilderService
                 {
                     SafeAddSkippedFile(skippedFiles, item.FileName, "File not found on disk");
                     onProgress?.Invoke(_localizer.GetString("skipping_missing_file", item.FileName));
-                    continue;
+                    return;
                 }
             }
 
@@ -949,7 +1071,7 @@ public class CacheBuilderService
                 {
                     SafeAddSkippedFile(skippedFiles, item.FileName, ex.Message);
                     onProgress?.Invoke(_localizer.GetString("skipping_unreadable_file", item.FileName, ex.Message));
-                    continue;
+                    return;
                 }
 
                 if (dbpfPackage != null)
@@ -962,32 +1084,48 @@ public class CacheBuilderService
                         {
                             case SpecialPackageType.World:
                             {
-                                string path = InstallAsWorld(dbpfPackage, originalName, nonPackageItems);
-                                if (path != null) nonPackageItems.Add(path);
+                                lock (nonPkgLock)
+                                {
+                                    string? path = InstallAsWorld(dbpfPackage, originalName, nonPackageItems);
+                                    if (path != null) nonPackageItems.Add(path);
+                                }
                                 break;
                             }
                             case SpecialPackageType.Lot:
                             {
-                                string path = InstallAsLot(dbpfPackage, originalName, nonPackageItems);
-                                if (path != null) nonPackageItems.Add(path);
+                                lock (nonPkgLock)
+                                {
+                                    string? path = InstallAsLot(dbpfPackage, originalName, nonPackageItems);
+                                    if (path != null) nonPackageItems.Add(path);
+                                }
                                 break;
                             }
                             case SpecialPackageType.Sim:
                             {
-                                string path = InstallAsSim(dbpfPackage, originalName, nonPackageItems);
-                                if (path != null) nonPackageItems.Add(path);
+                                lock (nonPkgLock)
+                                {
+                                    string? path = InstallAsSim(dbpfPackage, originalName, nonPackageItems);
+                                    if (path != null) nonPackageItems.Add(path);
+                                }
                                 break;
                             }
                             case SpecialPackageType.Pattern:
                             {
-                                InstallAsPattern(dbpfPackage, originalName, setPath);
+                                lock (nonPkgLock)
+                                {
+                                    InstallAsPattern(dbpfPackage, originalName, setPath);
+                                }
                                 break;
                             }
                             default:
                             {
                                 if (ValidatePackage(dbpfPackage))
                                 {
-                                    RebuildPackage(ref outputPkg, ref packageCount, activeSet, dbpfPackage, addedTgis, allSetsMap);
+                                    PreparePackageResources(dbpfPackage);
+                                    lock (outputLock)
+                                    {
+                                        RebuildPackage(ref outputPkg, ref packageCount, activeSet, dbpfPackage, addedTgis, allSetsMap, prePrepared: true);
+                                    }
                                 }
                                 else
                                 {
@@ -1019,8 +1157,11 @@ public class CacheBuilderService
                         var worldPkg = sims3Pack.Packages.FirstOrDefault(p => DetectSpecialPackageType(p) == SpecialPackageType.World);
                         if (worldPkg != null)
                         {
-                            string path = InstallAsWorld(worldPkg, originalName, nonPackageItems);
-                            if (path != null) nonPackageItems.Add(path);
+                            lock (nonPkgLock)
+                            {
+                                string? path = InstallAsWorld(worldPkg, originalName, nonPackageItems);
+                                if (path != null) nonPackageItems.Add(path);
+                            }
 
                             foreach (DBPFPackage package in sims3Pack.Packages)
                             {
@@ -1031,26 +1172,39 @@ public class CacheBuilderService
                                 {
                                     case SpecialPackageType.Lot:
                                     {
-                                        string lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                        if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        lock (nonPkgLock)
+                                        {
+                                            string? lotPath = InstallAsLot(package, originalName, nonPackageItems);
+                                            if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        }
                                         break;
                                     }
                                     case SpecialPackageType.Sim:
                                     {
-                                        string simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                        if (simPath != null) nonPackageItems.Add(simPath);
+                                        lock (nonPkgLock)
+                                        {
+                                            string? simPath = InstallAsSim(package, originalName, nonPackageItems);
+                                            if (simPath != null) nonPackageItems.Add(simPath);
+                                        }
                                         break;
                                     }
                                     case SpecialPackageType.Pattern:
                                     {
-                                        InstallAsPattern(package, originalName, setPath);
+                                        lock (nonPkgLock)
+                                        {
+                                            InstallAsPattern(package, originalName, setPath);
+                                        }
                                         break;
                                     }
                                     default:
                                     {
                                         if (ValidatePackage(package))
                                         {
-                                            RebuildPackage(ref outputPkg, ref packageCount, activeSet, package, addedTgis, allSetsMap);
+                                            PreparePackageResources(package);
+                                            lock (outputLock)
+                                            {
+                                                RebuildPackage(ref outputPkg, ref packageCount, activeSet, package, addedTgis, allSetsMap, prePrepared: true);
+                                            }
                                         }
                                         break;
                                     }
@@ -1066,26 +1220,39 @@ public class CacheBuilderService
                                 {
                                     case SpecialPackageType.Lot:
                                     {
-                                        string lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                        if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        lock (nonPkgLock)
+                                        {
+                                            string? lotPath = InstallAsLot(package, originalName, nonPackageItems);
+                                            if (lotPath != null) nonPackageItems.Add(lotPath);
+                                        }
                                         break;
                                     }
                                     case SpecialPackageType.Sim:
                                     {
-                                        string simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                        if (simPath != null) nonPackageItems.Add(simPath);
+                                        lock (nonPkgLock)
+                                        {
+                                            string? simPath = InstallAsSim(package, originalName, nonPackageItems);
+                                            if (simPath != null) nonPackageItems.Add(simPath);
+                                        }
                                         break;
                                     }
                                     case SpecialPackageType.Pattern:
                                     {
-                                        InstallAsPattern(package, originalName, setPath);
+                                        lock (nonPkgLock)
+                                        {
+                                            InstallAsPattern(package, originalName, setPath);
+                                        }
                                         break;
                                     }
                                     default:
                                     {
                                         if (ValidatePackage(package))
                                         {
-                                            RebuildPackage(ref outputPkg, ref packageCount, activeSet, package, addedTgis, allSetsMap);
+                                            PreparePackageResources(package);
+                                            lock (outputLock)
+                                            {
+                                                RebuildPackage(ref outputPkg, ref packageCount, activeSet, package, addedTgis, allSetsMap, prePrepared: true);
+                                            }
                                         }
                                         else
                                         {
@@ -1104,6 +1271,22 @@ public class CacheBuilderService
                     SafeAddSkippedFile(skippedFiles, item.FileName, ex.Message);
                     onProgress?.Invoke(_localizer.GetString("skipping_unreadable_sims3pack", item.FileName, ex.Message));
                 }
+            }
+        }
+
+        if (runItemsInParallel)
+        {
+            var parallelOptions = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1)
+            };
+            Parallel.ForEach(Partitioner.Create(metaEntities, EnumerablePartitionerOptions.NoBuffering), parallelOptions, ProcessItem);
+        }
+        else
+        {
+            foreach (var item in metaEntities)
+            {
+                ProcessItem(item);
             }
         }
 
@@ -1160,24 +1343,20 @@ public class CacheBuilderService
         }
     }
 
-    private void RebuildPackageStatic(ref DBPFPackageBuilder? outputPkg, ref int packageCount, string staticCachePath, DBPFPackage inputPkg, HashSet<TGI_Key> addedTgis)
+    private void PreparePackageResources(DBPFPackage package)
     {
-        var validResources = new List<ResourceEntry>();
-
-        foreach (var resource in inputPkg.Resources)
+        foreach (var resource in package.Resources)
         {
             if (resource.Key.Type == 3571055589u) FixPTRN(resource);
             else if (resource.Key.Type == 53690476) FixPTRN_XML(resource);
-
-            if (ValidateResource(resource.Key) && addedTgis.Add(resource.Key))
-            {
-                validResources.Add(resource);
-            }
         }
 
         if (_options.CompressionLevel > 0)
         {
-            var uncompressedResources = validResources.Where(r => !r.IsCompressed && r.Length >= 32).ToList();
+            var uncompressedResources = package.Resources
+                .Where(r => ShouldCompressResource(r, _options.CompressionLevel))
+                .ToList();
+
             if (uncompressedResources.Count == 1)
             {
                 try { uncompressedResources[0].Compress(_options.CompressionLevel); } catch { }
@@ -1192,9 +1371,26 @@ public class CacheBuilderService
                 });
             }
         }
+    }
 
-        foreach (var resource in validResources)
+    private void RebuildPackageStatic(
+        ref DBPFPackageBuilder? outputPkg,
+        ref int packageCount,
+        string staticCachePath,
+        DBPFPackage inputPkg,
+        HashSet<TGI_Key> addedTgis,
+        bool prePrepared = false)
+    {
+        if (!prePrepared)
         {
+            PreparePackageResources(inputPkg);
+        }
+
+        foreach (var resource in inputPkg.Resources)
+        {
+            if (!ValidateResource(resource.Key)) continue;
+            if (!addedTgis.Add(resource.Key)) continue;
+
             try
             {
                 if (outputPkg == null)
@@ -1224,157 +1420,25 @@ public class CacheBuilderService
         return Path.Combine(GetSims3FolderPath(), subFolder, fileName);
     }
 
-    private string InstallAsSim(DBPFPackage package, string name, ISet<string> nonPackageItems)
+    private void RebuildPackage(
+        ref DBPFPackageBuilder? outputPkg,
+        ref int packageCount,
+        SetsEntity activeSet,
+        DBPFPackage package,
+        HashSet<TGI_Key> addedTgis,
+        Dictionary<long, SetsEntity>? allSetsMap = null,
+        bool prePrepared = false)
     {
-        string basePath = Path.ChangeExtension(Path.Combine(_options.DocumentBaseDir, "Sims", name), ".sim");
-        string path = basePath;
-        int count = 1;
-        while (nonPackageItems.Contains(path))
+        if (!prePrepared)
         {
-            path = Path.ChangeExtension(Path.Combine(_options.DocumentBaseDir, "Sims", $"{name}_{count}"), ".sim");
-            count++;
+            PreparePackageResources(package);
         }
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        if (!File.Exists(path)) package.Export(path);
-        return path;
-    }
-
-    private string InstallAsLot(DBPFPackage package, string name, ISet<string> nonPackageItems)
-    {
-        string basePath = Path.ChangeExtension(Path.Combine(_options.DocumentBaseDir, "Lots", name), ".package");
-        string path = basePath;
-        int count = 1;
-        while (nonPackageItems.Contains(path))
-        {
-            path = Path.ChangeExtension(Path.Combine(_options.DocumentBaseDir, "Lots", $"{name}_{count}"), ".package");
-            count++;
-        }
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        if (!File.Exists(path)) package.Export(path);
-        return path;
-    }
-
-    public static string GetWorldName(DBPFPackage package, string defaultName)
-    {
-        try
-        {
-            // 0xD9BE8E89 (3653044489u) is the World Name resource in Sims 3 .world DBPF packages
-            var res = package.Resources.FirstOrDefault(r => r.Key.Type == 3653044489u);
-            if (res != null)
-            {
-                byte[] bytes = res.Read();
-                if (bytes.Length >= 4)
-                {
-                    int len = BitConverter.ToInt32(bytes, 0);
-                    if (len > 0 && bytes.Length >= 4 + len * 2)
-                    {
-                        string name = System.Text.Encoding.Unicode.GetString(bytes, 4, len * 2).Trim();
-                        var invalidChars = Path.GetInvalidFileNameChars();
-                        string cleanName = new string(name.Where(c => !invalidChars.Contains(c) && c != '/' && c != '\\').ToArray()).Trim();
-                        if (!string.IsNullOrWhiteSpace(cleanName))
-                        {
-                            return cleanName;
-                        }
-                    }
-                }
-            }
-        }
-        catch { }
-
-        string fallback = Path.GetFileNameWithoutExtension(defaultName);
-        var invalid = Path.GetInvalidFileNameChars();
-        return new string(fallback.Where(c => !invalid.Contains(c) && c != '/' && c != '\\').ToArray()).Trim();
-    }
-
-    private string InstallAsWorld(DBPFPackage package, string defaultName, ISet<string> nonPackageItems)
-    {
-        string worldName = GetWorldName(package, defaultName);
-        string worldsDir = Path.Combine(_options.DocumentBaseDir, "Worlds");
-        Directory.CreateDirectory(worldsDir);
-
-        string basePath = Path.Combine(worldsDir, $"{worldName}.world");
-        string path = basePath;
-        int count = 1;
-        while (nonPackageItems.Contains(path))
-        {
-            path = Path.Combine(worldsDir, $"{worldName}_{count}.world");
-            count++;
-        }
-
-        package.Export(path);
-        return path;
-    }
-
-    private string InstallAsPattern(DBPFPackage package, string name, string targetFolder)
-    {
-        string cleanName = SanitizeForCache(name);
-        if (string.IsNullOrWhiteSpace(cleanName)) cleanName = "Pattern";
-        string basePath = Path.Combine(targetFolder, $"Pattern_{cleanName}.package");
-        string path = basePath;
-        int count = 1;
-        while (File.Exists(path))
-        {
-            path = Path.Combine(targetFolder, $"Pattern_{cleanName}_{count}.package");
-            count++;
-        }
-        Directory.CreateDirectory(targetFolder);
-        package.Export(path);
-        return path;
-    }
-
-    private static bool ValidatePackage(DBPFPackage package)
-    {
-        foreach (var resource in package.Resources)
-        {
-            if (resource.Key.Type == DollDressedKey.Type && resource.Key.Group == DollDressedKey.Group && resource.Key.Instance == DollDressedKey.Instance)
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private bool ValidateResource(TGI_Key key)
-    {
-        if (key.Type == 1944665835) return false;
-        return true;
-    }
-
-    private void RebuildPackage(ref DBPFPackageBuilder? outputPkg, ref int packageCount, SetsEntity activeSet, DBPFPackage package, HashSet<TGI_Key> addedTgis, Dictionary<long, SetsEntity>? allSetsMap = null)
-    {
-        var validResources = new List<ResourceEntry>();
 
         foreach (var resource in package.Resources)
         {
-            if (resource.Key.Type == 3571055589u) FixPTRN(resource);
-            else if (resource.Key.Type == 53690476) FixPTRN_XML(resource);
+            if (!ValidateResource(resource.Key)) continue;
+            if (!addedTgis.Add(resource.Key)) continue;
 
-            if (ValidateResource(resource.Key) && addedTgis.Add(resource.Key))
-            {
-                validResources.Add(resource);
-            }
-        }
-
-        if (_options.CompressionLevel > 0)
-        {
-            var uncompressedResources = validResources.Where(r => !r.IsCompressed && r.Length >= 32).ToList();
-            if (uncompressedResources.Count == 1)
-            {
-                try { uncompressedResources[0].Compress(_options.CompressionLevel); } catch { }
-            }
-            else if (uncompressedResources.Count > 1)
-            {
-                var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1) };
-                Parallel.ForEach(uncompressedResources, parallelOptions, resource =>
-                {
-                    try { resource.Compress(_options.CompressionLevel); }
-                    catch (Exception) { /* If compression fails, keep original uncompressed resource */ }
-                });
-            }
-        }
-
-        foreach (var resource in validResources)
-        {
             try
             {
                 if (outputPkg == null)
@@ -1398,12 +1462,12 @@ public class CacheBuilderService
     private void FixPTRN(ResourceEntry resource)
     {
         byte[] data = resource.Read();
-        if (!data.AsSpan().Contains((byte)':')) return;
+        if (data.AsSpan().IndexOf(ColonSpaceBytes) < 0) return;
         string text = System.Text.Encoding.UTF8.GetString(data);
         if (!text.Contains(": ")) return;
 
         XmlDocument xmlDocument = new XmlDocument();
-        try { xmlDocument.LoadXml(text); } catch (Exception) { return; }
+        try { xmlDocument.LoadXml(text); } catch { }
         bool flag = false;
         XmlNodeList elementsByTagName = xmlDocument.GetElementsByTagName("pattern");
         foreach (XmlElement item in elementsByTagName)
@@ -1426,12 +1490,12 @@ public class CacheBuilderService
     private void FixPTRN_XML(ResourceEntry resource)
     {
         byte[] data = resource.Read();
-        if (!data.AsSpan().Contains((byte)':')) return;
+        if (data.AsSpan().IndexOf(ColonSpaceBytes) < 0) return;
         string text = System.Text.Encoding.UTF8.GetString(data);
         if (!text.Contains(": ")) return;
 
         XmlDocument xmlDocument = new XmlDocument();
-        try { xmlDocument.LoadXml(text); } catch (Exception) { return; }
+        try { xmlDocument.LoadXml(text); } catch { }
         bool flag = false;
         XmlNodeList elementsByTagName = xmlDocument.GetElementsByTagName("complate");
         foreach (XmlElement item in elementsByTagName)
@@ -1459,8 +1523,14 @@ public class CacheBuilderService
             try
             {
                 using var sw = new StreamWriter(mainResourceCfg, false);
-                sw.WriteLine("Priority 500");
+                sw.WriteLine("Priority 501");
                 sw.WriteLine("Scan \"Cache/Config/\"");
+                sw.WriteLine("Priority 1000");
+                sw.WriteLine("PackedFile \"Overrides/*.package\"");
+                sw.WriteLine("PackedFile \"Overrides/*/*.package\"");
+                sw.WriteLine("PackedFile \"Overrides/*/*/*.package\"");
+                sw.WriteLine("PackedFile \"Overrides/*/*/*/*.package\"");
+                sw.WriteLine("Priority 500");
                 sw.WriteLine("PackedFile \"Packages/*.package\"");
                 sw.WriteLine("PackedFile \"Packages/*/*.package\"");
                 sw.WriteLine("PackedFile \"Packages/*/*/*.package\"");
@@ -1502,10 +1572,7 @@ public class CacheBuilderService
                     {
                         hasScan = true;
                         // Normalize unquoted relative Scan to Scan "Cache/Config/"
-                        if (!trimmed.Contains("\"") && (trimmed.Equals("Scan Cache/Config/", StringComparison.OrdinalIgnoreCase) ||
-                                                       trimmed.Equals("Scan Cache/Config", StringComparison.OrdinalIgnoreCase) ||
-                                                       trimmed.Equals(@"Scan Cache\Config\", StringComparison.OrdinalIgnoreCase) ||
-                                                       trimmed.Equals(@"Scan Cache\Config", StringComparison.OrdinalIgnoreCase)))
+                        if (!trimmed.Contains('"'))
                         {
                             lines[i] = "Scan \"Cache/Config/\"";
                             modified = true;
@@ -1516,25 +1583,186 @@ public class CacheBuilderService
 
                 if (!hasScan)
                 {
-                    int insertIndex = 0;
-                    for (int i = 0; i < lines.Count; i++)
-                    {
-                        if (lines[i].TrimStart().StartsWith("Priority", StringComparison.OrdinalIgnoreCase))
-                        {
-                            insertIndex = i + 1;
-                            break;
-                        }
-                    }
-                    lines.Insert(insertIndex, "Scan \"Cache/Config/\"");
+                    // Insert Scan "Cache/Config/" near the top of the file
+                    int insertIdx = lines.FindIndex(l => l.Trim().StartsWith("Priority", StringComparison.OrdinalIgnoreCase));
+                    if (insertIdx < 0) insertIdx = 0;
+                    lines.Insert(insertIdx, "Scan \"Cache/Config/\"");
                     modified = true;
+                }
+
+                // 3. Ensure Priority 501 is set for the Scan or Priority 500+ exists
+                bool hasPriority501 = lines.Any(l => l.Trim().Equals("Priority 501", StringComparison.OrdinalIgnoreCase));
+                if (!hasPriority501)
+                {
+                    int scanIdx = lines.FindIndex(l => l.Trim().StartsWith("Scan", StringComparison.OrdinalIgnoreCase) &&
+                        l.Contains("Cache/Config", StringComparison.OrdinalIgnoreCase));
+                    if (scanIdx >= 0)
+                    {
+                        lines.Insert(scanIdx, "Priority 501");
+                        modified = true;
+                    }
                 }
 
                 if (modified)
                 {
-                    File.WriteAllText(mainResourceCfg, string.Join(Environment.NewLine, lines));
+                    File.WriteAllLines(mainResourceCfg, lines);
                 }
             }
             catch { }
         }
+    }
+
+    private string? InstallAsWorld(DBPFPackage package, string defaultName, ISet<string> nonPackageItems)
+    {
+        string worldName = GetWorldName(package, defaultName);
+        string worldsDir = Path.Combine(_options.DocumentBaseDir, "Worlds");
+        Directory.CreateDirectory(worldsDir);
+
+        string basePath = Path.Combine(worldsDir, $"{worldName}.world");
+        string path = basePath;
+        int count = 1;
+        while (nonPackageItems.Contains(path))
+        {
+            path = Path.Combine(worldsDir, $"{worldName}_{count}.world");
+            count++;
+        }
+
+        package.Export(path);
+        return path;
+    }
+
+    private string? InstallAsLot(DBPFPackage package, string defaultName, ISet<string> nonPackageItems)
+    {
+        string lotName = GetLotName(package, defaultName);
+        string lotsDir = Path.Combine(_options.DocumentBaseDir, "Lots");
+        Directory.CreateDirectory(lotsDir);
+
+        string basePath = Path.Combine(lotsDir, $"{lotName}.package");
+        string path = basePath;
+        int count = 1;
+        while (nonPackageItems.Contains(path))
+        {
+            path = Path.Combine(lotsDir, $"{lotName}_{count}.package");
+            count++;
+        }
+
+        package.Export(path);
+        return path;
+    }
+
+    private string? InstallAsSim(DBPFPackage package, string defaultName, ISet<string> nonPackageItems)
+    {
+        string simName = GetSimName(package, defaultName);
+        string simsDir = Path.Combine(_options.DocumentBaseDir, "Sims");
+        Directory.CreateDirectory(simsDir);
+
+        string basePath = Path.Combine(simsDir, $"{simName}.sim");
+        string path = basePath;
+        int count = 1;
+        while (nonPackageItems.Contains(path))
+        {
+            path = Path.Combine(simsDir, $"{simName}_{count}.sim");
+            count++;
+        }
+
+        package.Export(path);
+        return path;
+    }
+
+    private void InstallAsPattern(DBPFPackage package, string defaultName, string outputDir)
+    {
+        string patternName = GetPatternName(package, defaultName);
+        Directory.CreateDirectory(outputDir);
+        string path = Path.Combine(outputDir, $"Pattern_{patternName}.package");
+        package.Export(path);
+    }
+
+    private string GetPatternName(DBPFPackage package, string defaultName)
+    {
+        string name = defaultName;
+        ResourceEntry? resourceEntry = package.Resources.Find((ResourceEntry r) => r.Key.Type == 3571055589u);
+        if (resourceEntry != null)
+        {
+            byte[] bytes = resourceEntry.Read();
+            string @string = System.Text.Encoding.UTF8.GetString(bytes);
+            XmlDocument xmlDocument = new XmlDocument();
+            try
+            {
+                xmlDocument.LoadXml(@string);
+                XmlNode? xmlNode = xmlDocument.SelectSingleNode("/pattern/name");
+                if (xmlNode != null && !string.IsNullOrEmpty(xmlNode.InnerText))
+                {
+                    name = xmlNode.InnerText;
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+        name = SanitizeFileName(name);
+        return name;
+    }
+
+    private string GetSimName(DBPFPackage package, string defaultName)
+    {
+        string name = defaultName;
+        ResourceEntry? resourceEntry = package.Resources.Find((ResourceEntry r) => r.Key.Type == 83396964);
+        if (resourceEntry != null)
+        {
+            byte[] bytes = resourceEntry.Read();
+            string @string = System.Text.Encoding.Unicode.GetString(bytes);
+            name = @string.Split(new char[1])[0];
+        }
+        name = SanitizeFileName(name);
+        return name;
+    }
+
+    private string GetWorldName(DBPFPackage package, string defaultName)
+    {
+        string text = defaultName;
+        ResourceEntry? resourceEntry = package.Resources.Find((ResourceEntry r) => r.Key.Type == 107542056);
+        if (resourceEntry != null)
+        {
+            byte[] bytes = resourceEntry.Read();
+            string @string = System.Text.Encoding.Unicode.GetString(bytes);
+            text = @string.Split(new char[1])[0];
+        }
+        text = SanitizeFileName(text);
+        return text;
+    }
+
+    private string GetLotName(DBPFPackage package, string defaultName)
+    {
+        string text = defaultName;
+        ResourceEntry? resourceEntry = package.Resources.Find((ResourceEntry r) => r.Key.Type == 3496170587u);
+        if (resourceEntry != null)
+        {
+            byte[] bytes = resourceEntry.Read();
+            string @string = System.Text.Encoding.Unicode.GetString(bytes);
+            text = @string.Split(new char[1])[0];
+        }
+        text = SanitizeFileName(text);
+        return text;
+    }
+
+    private string SanitizeFileName(string name)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        return new string(name.Select(c => invalid.Contains(c) ? '_' : c).ToArray());
+    }
+
+    private bool ValidateResource(TGI_Key key)
+    {
+        if (key.Type == 1944665835) return false;
+        return true;
+    }
+
+    private bool ValidatePackage(DBPFPackage package)
+    {
+        foreach (var resource in package.Resources)
+        {
+            if (resource.Key.Equals(DollDressedKey)) return false;
+        }
+        return true;
     }
 }
