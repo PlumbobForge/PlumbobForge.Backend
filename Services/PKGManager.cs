@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using PlumbobForge.Backend.Database;
@@ -15,6 +16,8 @@ namespace PlumbobForge.Backend.Services;
 
 public class PKGManager
 {
+    private static readonly SemaphoreSlim _scanLock = new(1, 1);
+
     private readonly AppDbContext _db;
     private readonly IOptionsMonitor<PlumbobForgeOptions> _optionsMonitor;
     private PlumbobForgeOptions _options => _optionsMonitor.CurrentValue;
@@ -575,183 +578,229 @@ public class PKGManager
 
     private async Task CheckOrphanPackagesAsync(long? targetSetId = null)
     {
-        if (!Directory.Exists(_options.ManagedPackageFolderPath)) return;
+        if (string.IsNullOrWhiteSpace(_options.ManagedPackageFolderPath) || !Directory.Exists(_options.ManagedPackageFolderPath)) return;
 
-        var setEntities = await _db.SetsEntities.ToListAsync();
-
-        SetsEntity assignSet;
-        if (targetSetId.HasValue)
+        await _scanLock.WaitAsync();
+        try
         {
-            var requestedSet = setEntities.FirstOrDefault(s => s.Id == targetSetId.Value);
-            assignSet = requestedSet ?? setEntities.FirstOrDefault(s => s.Name == "Default") ?? setEntities.First();
-        }
-        else
-        {
-            assignSet = setEntities.FirstOrDefault(s => s.Name == "Default") ?? setEntities.First();
-        }
+            var setEntities = await _db.SetsEntities.ToListAsync();
 
-        var metaEntities = await _db.MetaEntities.ToListAsync();
-        var metaMap = new Dictionary<string, MetaEntity>(StringComparer.OrdinalIgnoreCase);
-        foreach (var m in metaEntities)
-        {
-            if (!metaMap.ContainsKey(m.FileName)) metaMap[m.FileName] = m;
-        }
-
-        var setMap = setEntities.ToDictionary(s => s.Id);
-        var tombstoneEntities = await _db.Tombstones.ToListAsync();
-        var tombstoneMap = new Dictionary<string, TombstoneEntity>(StringComparer.OrdinalIgnoreCase);
-        foreach (var t in tombstoneEntities)
-        {
-            if (!tombstoneMap.ContainsKey(t.FileName)) tombstoneMap[t.FileName] = t;
-        }
-
-        var currentFilesOnDisk = Directory.GetFiles(_options.ManagedPackageFolderPath, "*.*", SearchOption.AllDirectories)
-            .Where(f => f.EndsWith(".package", StringComparison.OrdinalIgnoreCase) ||
-                        f.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase) ||
-                        f.EndsWith(".world", StringComparison.OrdinalIgnoreCase) ||
-                        f.EndsWith(".sim", StringComparison.OrdinalIgnoreCase))
-            .ToList();
-
-        var diskFileMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var file in currentFilesOnDisk)
-        {
-            string fn = Path.GetFileName(file);
-            if (!diskFileMap.ContainsKey(fn))
+            SetsEntity assignSet;
+            if (targetSetId.HasValue)
             {
-                diskFileMap[fn] = file;
-            }
-        }
-
-        var toRemoveFromDb = metaEntities.Where(m => !diskFileMap.ContainsKey(m.FileName)).ToList();
-        if (toRemoveFromDb.Count > 0)
-        {
-            var setIdsToDirty = toRemoveFromDb.Where(m => m.SetsEntityId.HasValue).Select(m => m.SetsEntityId!.Value).Distinct().ToList();
-            var setsToDirty = setEntities.Where(s => setIdsToDirty.Contains(s.Id)).ToList();
-            foreach (var s in setsToDirty) s.Dirty = true;
-
-            foreach (var missing in toRemoveFromDb)
-            {
-                _thumbnailService.DeleteThumbnail(missing.Id);
-            }
-
-            _db.MetaEntities.RemoveRange(toRemoveFromDb);
-        }
-
-        bool metaAddedOrUpdated = false;
-
-        foreach (var kvp in diskFileMap)
-        {
-            string fileName = kvp.Key;
-            string filePath = kvp.Value;
-            var fileInfo = new FileInfo(filePath);
-            double currentSizeKb = fileInfo.Length / 1024.0;
-
-            if (!metaMap.TryGetValue(fileName, out var existingMeta))
-            {
-                bool isSims3Pack = Path.GetExtension(fileName).Equals(".sims3pack", StringComparison.OrdinalIgnoreCase);
-
-                if (!isSims3Pack && _options.CompressionLevel > 0)
-                {
-                    try
-                    {
-                        if (DBPFPackage.OptimizePackage(filePath, _options.CompressionLevel))
-                        {
-                            fileInfo.Refresh();
-                            currentSizeKb = fileInfo.Length / 1024.0;
-                        }
-                    }
-                    catch { }
-                }
-
-                (string PackageType, string CASCategories, string CASAge, string CASGender, string CASOutfitCategory) typeInfo = ("Other", "", "", "", "");
-                try
-                {
-                    typeInfo = DetectPackageType(filePath, isSims3Pack);
-                }
-                catch { /* Ignore lock/read error on raw scan; tombstone or recheck will handle type */ }
-
-                tombstoneMap.TryGetValue(fileName, out var tombstone);
-
-                SetsEntity targetSet = assignSet;
-                if (tombstone != null && tombstone.SetsEntityId.HasValue && setMap.TryGetValue(tombstone.SetsEntityId.Value, out var foundSet))
-                {
-                    targetSet = foundSet;
-                }
-
-                var meta = new MetaEntity
-                {
-                    FileName = fileName,
-                    FileType = isSims3Pack ? "TS3PACK" : fileName.EndsWith(".world", StringComparison.OrdinalIgnoreCase) ? "WORLD" : fileName.EndsWith(".sim", StringComparison.OrdinalIgnoreCase) ? "SIM" : "DBPF",
-                    PackageType = tombstone != null ? tombstone.PackageType : typeInfo.PackageType,
-                    CASCategories = tombstone != null ? tombstone.CASCategories : typeInfo.CASCategories,
-                    CASAge = tombstone != null ? tombstone.CASAge : typeInfo.CASAge,
-                    CASGender = tombstone != null ? tombstone.CASGender : typeInfo.CASGender,
-                    CASOutfitCategory = tombstone != null ? tombstone.CASOutfitCategory : typeInfo.CASOutfitCategory,
-                    IsUserTagged = tombstone != null ? tombstone.IsUserTagged : false,
-                    UserTags = tombstone != null ? tombstone.UserTags : null,
-                    Description = tombstone?.Description ?? string.Empty,
-                    IsFavorite = tombstone != null && tombstone.IsFavorite,
-                    CompleteFileName = filePath,
-                    SetsEntity = targetSet,
-                    InstallDate = DateTime.Now.ToString(),
-                    Manifest = string.Empty,
-                    Enabled = true,
-                    FileSize = currentSizeKb
-                };
-
-                if (tombstone != null)
-                {
-                    _db.Tombstones.Remove(tombstone);
-                }
-
-                targetSet.Dirty = true;
-                _db.MetaEntities.Add(meta);
-                metaAddedOrUpdated = true;
+                var requestedSet = setEntities.FirstOrDefault(s => s.Id == targetSetId.Value);
+                assignSet = requestedSet ?? setEntities.FirstOrDefault(s => s.Name == "Default") ?? setEntities.First();
             }
             else
             {
-                bool isSims3Pack = Path.GetExtension(fileName).Equals(".sims3pack", StringComparison.OrdinalIgnoreCase);
-                bool sizeChanged = Math.Abs(existingMeta.FileSize - currentSizeKb) > 0.01;
+                assignSet = setEntities.FirstOrDefault(s => s.Name == "Default") ?? setEntities.First();
+            }
 
-                if (sizeChanged || existingMeta.CompleteFileName != filePath)
+            var metaEntities = await _db.MetaEntities.ToListAsync();
+
+            // Self-healing: Deduplicate any existing duplicate MetaEntities by FileName
+            var duplicateGroups = metaEntities
+                .GroupBy(m => m.FileName, StringComparer.OrdinalIgnoreCase)
+                .Where(g => g.Count() > 1)
+                .ToList();
+
+            if (duplicateGroups.Count > 0)
+            {
+                var duplicatesToRemove = new List<MetaEntity>();
+                string thumbDir = _thumbnailService.GetThumbnailDirectory();
+
+                foreach (var group in duplicateGroups)
                 {
+                    var preferred = group
+                        .OrderByDescending(m => File.Exists(Path.Combine(thumbDir, $"{m.Id}.thumb")))
+                        .ThenByDescending(m => m.IsUserTagged || !string.IsNullOrWhiteSpace(m.UserTags))
+                        .ThenByDescending(m => m.IsFavorite)
+                        .ThenBy(m => m.Id)
+                        .First();
+
+                    foreach (var dup in group)
+                    {
+                        if (dup.Id != preferred.Id)
+                        {
+                            duplicatesToRemove.Add(dup);
+                            metaEntities.Remove(dup);
+                        }
+                    }
+                }
+
+                if (duplicatesToRemove.Count > 0)
+                {
+                    _db.MetaEntities.RemoveRange(duplicatesToRemove);
+                    await _db.SaveChangesAsync();
+                }
+            }
+
+            var metaMap = new Dictionary<string, MetaEntity>(StringComparer.OrdinalIgnoreCase);
+            foreach (var m in metaEntities)
+            {
+                if (!metaMap.ContainsKey(m.FileName)) metaMap[m.FileName] = m;
+            }
+
+            var setMap = setEntities.ToDictionary(s => s.Id);
+            var tombstoneEntities = await _db.Tombstones.ToListAsync();
+            var tombstoneMap = new Dictionary<string, TombstoneEntity>(StringComparer.OrdinalIgnoreCase);
+            foreach (var t in tombstoneEntities)
+            {
+                if (!tombstoneMap.ContainsKey(t.FileName)) tombstoneMap[t.FileName] = t;
+            }
+
+            var currentFilesOnDisk = Directory.GetFiles(_options.ManagedPackageFolderPath, "*.*", SearchOption.AllDirectories)
+                .Where(f => f.EndsWith(".package", StringComparison.OrdinalIgnoreCase) ||
+                            f.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase) ||
+                            f.EndsWith(".world", StringComparison.OrdinalIgnoreCase) ||
+                            f.EndsWith(".sim", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var diskFileMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in currentFilesOnDisk)
+            {
+                string fn = Path.GetFileName(file);
+                if (!diskFileMap.ContainsKey(fn))
+                {
+                    diskFileMap[fn] = file;
+                }
+            }
+
+            if (diskFileMap.Count == 0 && metaEntities.Count > 0)
+            {
+                AppLogger.LogWarning($"[CheckOrphanPackages] Disk scan found 0 files in '{_options.ManagedPackageFolderPath}', but database has {metaEntities.Count} items. Aborting orphan package deletion to prevent catastrophic data loss.");
+                return;
+            }
+
+            var toRemoveFromDb = metaEntities.Where(m => !diskFileMap.ContainsKey(m.FileName)).ToList();
+            if (toRemoveFromDb.Count > 0)
+            {
+                var setIdsToDirty = toRemoveFromDb.Where(m => m.SetsEntityId.HasValue).Select(m => m.SetsEntityId!.Value).Distinct().ToList();
+                var setsToDirty = setEntities.Where(s => setIdsToDirty.Contains(s.Id)).ToList();
+                foreach (var s in setsToDirty) s.Dirty = true;
+
+                foreach (var missing in toRemoveFromDb)
+                {
+                    _thumbnailService.DeleteThumbnail(missing.Id);
+                }
+
+                _db.MetaEntities.RemoveRange(toRemoveFromDb);
+            }
+
+            bool metaAddedOrUpdated = false;
+            int pendingBatchCount = 0;
+
+            foreach (var kvp in diskFileMap)
+            {
+                string fileName = kvp.Key;
+                string filePath = kvp.Value;
+                var fileInfo = new FileInfo(filePath);
+                double currentSizeKb = fileInfo.Length / 1024.0;
+
+                if (!metaMap.TryGetValue(fileName, out var existingMeta))
+                {
+                    bool isSims3Pack = Path.GetExtension(fileName).Equals(".sims3pack", StringComparison.OrdinalIgnoreCase);
+
                     (string PackageType, string CASCategories, string CASAge, string CASGender, string CASOutfitCategory) typeInfo = ("Other", "", "", "", "");
                     try
                     {
                         typeInfo = DetectPackageType(filePath, isSims3Pack);
                     }
-                    catch { /* Ignore lock/read error on raw scan */ }
+                    catch { /* Ignore lock/read error on raw scan; tombstone or recheck will handle type */ }
 
-                    existingMeta.FileType = isSims3Pack ? "TS3PACK" : "DBPF";
-                    if (!existingMeta.IsUserTagged)
-                    {
-                        existingMeta.PackageType = typeInfo.PackageType;
-                        existingMeta.CASCategories = typeInfo.CASCategories;
-                        existingMeta.CASAge = typeInfo.CASAge;
-                        existingMeta.CASGender = typeInfo.CASGender;
-                        existingMeta.CASOutfitCategory = typeInfo.CASOutfitCategory;
-                    }
-                    existingMeta.CompleteFileName = filePath;
-                    existingMeta.FileSize = currentSizeKb;
-                    existingMeta.InstallDate = DateTime.Now.ToString();
+                    tombstoneMap.TryGetValue(fileName, out var tombstone);
 
-                    if (existingMeta.SetsEntity != null)
+                    SetsEntity targetSet = assignSet;
+                    if (tombstone != null && tombstone.SetsEntityId.HasValue && setMap.TryGetValue(tombstone.SetsEntityId.Value, out var foundSet))
                     {
-                        existingMeta.SetsEntity.Dirty = true;
+                        targetSet = foundSet;
                     }
-                    else
+
+                    var meta = new MetaEntity
                     {
-                        existingMeta.SetsEntity = assignSet;
-                        assignSet.Dirty = true;
+                        FileName = fileName,
+                        FileType = isSims3Pack ? "TS3PACK" : fileName.EndsWith(".world", StringComparison.OrdinalIgnoreCase) ? "WORLD" : fileName.EndsWith(".sim", StringComparison.OrdinalIgnoreCase) ? "SIM" : "DBPF",
+                        PackageType = tombstone != null ? tombstone.PackageType : typeInfo.PackageType,
+                        CASCategories = tombstone != null ? tombstone.CASCategories : typeInfo.CASCategories,
+                        CASAge = tombstone != null ? tombstone.CASAge : typeInfo.CASAge,
+                        CASGender = tombstone != null ? tombstone.CASGender : typeInfo.CASGender,
+                        CASOutfitCategory = tombstone != null ? tombstone.CASOutfitCategory : typeInfo.CASOutfitCategory,
+                        IsUserTagged = tombstone != null ? tombstone.IsUserTagged : false,
+                        UserTags = tombstone != null ? tombstone.UserTags : null,
+                        Description = tombstone?.Description ?? string.Empty,
+                        IsFavorite = tombstone != null && tombstone.IsFavorite,
+                        CompleteFileName = filePath,
+                        SetsEntity = targetSet,
+                        InstallDate = DateTime.Now.ToString(),
+                        Manifest = string.Empty,
+                        Enabled = true,
+                        FileSize = currentSizeKb
+                    };
+
+                    if (tombstone != null)
+                    {
+                        _db.Tombstones.Remove(tombstone);
                     }
+
+                    targetSet.Dirty = true;
+                    _db.MetaEntities.Add(meta);
                     metaAddedOrUpdated = true;
+                    pendingBatchCount++;
+                    if (pendingBatchCount >= 100)
+                    {
+                        await _db.SaveChangesAsync();
+                        pendingBatchCount = 0;
+                    }
+                }
+                else
+                {
+                    bool isSims3Pack = Path.GetExtension(fileName).Equals(".sims3pack", StringComparison.OrdinalIgnoreCase);
+                    bool sizeChanged = Math.Abs(existingMeta.FileSize - currentSizeKb) > 0.01;
+
+                    if (sizeChanged || existingMeta.CompleteFileName != filePath)
+                    {
+                        (string PackageType, string CASCategories, string CASAge, string CASGender, string CASOutfitCategory) typeInfo = ("Other", "", "", "", "");
+                        try
+                        {
+                            typeInfo = DetectPackageType(filePath, isSims3Pack);
+                        }
+                        catch { /* Ignore lock/read error on raw scan */ }
+
+                        existingMeta.FileType = isSims3Pack ? "TS3PACK" : "DBPF";
+                        if (!existingMeta.IsUserTagged)
+                        {
+                            existingMeta.PackageType = typeInfo.PackageType;
+                            existingMeta.CASCategories = typeInfo.CASCategories;
+                            existingMeta.CASAge = typeInfo.CASAge;
+                            existingMeta.CASGender = typeInfo.CASGender;
+                            existingMeta.CASOutfitCategory = typeInfo.CASOutfitCategory;
+                        }
+                        existingMeta.CompleteFileName = filePath;
+                        existingMeta.FileSize = currentSizeKb;
+                        existingMeta.InstallDate = DateTime.Now.ToString();
+
+                        if (existingMeta.SetsEntity != null)
+                        {
+                            existingMeta.SetsEntity.Dirty = true;
+                        }
+                        else
+                        {
+                            existingMeta.SetsEntity = assignSet;
+                            assignSet.Dirty = true;
+                        }
+                        metaAddedOrUpdated = true;
+                    }
                 }
             }
-        }
 
-        if (toRemoveFromDb.Count > 0 || metaAddedOrUpdated)
+            if (toRemoveFromDb.Count > 0 || metaAddedOrUpdated)
+            {
+                await _db.SaveChangesAsync();
+            }
+        }
+        finally
         {
-            await _db.SaveChangesAsync();
+            _scanLock.Release();
         }
     }
 
