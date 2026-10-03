@@ -2,16 +2,14 @@ namespace PlumbobForge.Backend.Configuration;
 
 public class PlumbobForgeOptions
 {
-    public const string SectionName = "PlumbobForge";
-
     public string DocumentBaseDir { get; set; } = "";
     public string DownloadFolderName { get; set; } = "Downloads";
-    public string ArchiveFolderName { get; set; } = "Archives";
-    public string TS3PackFolderName { get; set; } = "ConvertedTS3Packs";
+    public string ArchiveFolderName { get; set; } = "Archive";
+    public string TS3PackFolderName { get; set; } = "Downloads";
     public string ManagedPackageFolderName { get; set; } = "Library";
     public string SetCacheFolderName { get; set; } = "Builds";
     public string LegacyPackageFolderName { get; set; } = "Legacy";
-    public string TS3PackStoreFolderName { get; set; } = "TS3PackStore";
+    public string TS3PackStoreFolderName { get; set; } = "Store";
     public string GameFilesDir { get; set; } = "";
     public int CompressionLevel { get; set; } = 1;
     public bool HasSeenWalkthrough { get; set; } = false;
@@ -20,10 +18,13 @@ public class PlumbobForgeOptions
     public string Theme { get; set; } = "Dark";
     public string AccentColor { get; set; } = "Emerald";
     public string CacheMethod { get; set; } = "Dynamic";
+    public bool AutoRebuildStaticCache { get; set; } = false;
     public bool EnableAutoScan { get; set; } = true;
     public System.Collections.Generic.List<string> ObservedFolders { get; set; } = new();
     public string LogsFolderName { get; set; } = "Logs";
     public string LastActiveTool { get; set; } = "Cache";
+    public int LastOptimizedCacheMilestone { get; set; } = 0;
+    public string LastOptimizedCacheVersion { get; set; } = "";
 
     public string DownloadFolderPath => string.IsNullOrEmpty(DownloadFolderName) ? "" : System.IO.Path.Combine(DocumentBaseDir, DownloadFolderName);
     public string ArchiveFolderPath => string.IsNullOrEmpty(ArchiveFolderName) ? "" : System.IO.Path.Combine(DocumentBaseDir, ArchiveFolderName);
