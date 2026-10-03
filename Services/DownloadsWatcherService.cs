@@ -36,7 +36,16 @@ public class DownloadsWatcherService : BackgroundService
     {
         ReloadWatchers();
 
-        // Initial scan on startup (only if EnableAutoScan is enabled)
+        // Defer initial scan slightly so app launch and initial UI render have 100% of CPU and disk bandwidth
+        try
+        {
+            await Task.Delay(3000, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
         using (var scope = _serviceProvider.CreateScope())
         {
             var options = ResolveOptions(scope);
@@ -179,8 +188,12 @@ public class DownloadsWatcherService : BackgroundService
                     }
                 }
 
-                // Immediately trigger an import check on the observed folders
-                _ = Task.Run(() => TriggerAutoImportAsync("Observed folders updated"));
+                // Defer background auto-scan check so UI launch and first render complete unhindered
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(4000);
+                    await TriggerAutoImportAsync("Observed folders updated");
+                });
             }
             else
             {
