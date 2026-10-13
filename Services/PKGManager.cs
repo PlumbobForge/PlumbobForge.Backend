@@ -303,22 +303,7 @@ public class PKGManager
 
     public string GetSims3UserFolderPath()
     {
-        string docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
-        string eaDir = Path.Combine(docs, "Electronic Arts");
-        if (Directory.Exists(eaDir))
-        {
-            var candidates = Directory.GetDirectories(eaDir)
-                .Where(d => Path.GetFileName(d).Contains("Sims 3", StringComparison.OrdinalIgnoreCase))
-                .ToList();
-
-            if (candidates.Count > 0)
-            {
-                var exactMatch = candidates.FirstOrDefault(d => Path.GetFileName(d).Equals("The Sims 3", StringComparison.OrdinalIgnoreCase));
-                return exactMatch ?? candidates[0];
-            }
-        }
-
-        return Path.Combine(eaDir, "The Sims 3");
+        return Sims3PathResolver.ResolveSims3UserFolder(_options.Sims3UserDir);
     }
 
     public string GetDownloadsFolderPath()
@@ -611,6 +596,11 @@ public class PKGManager
 
                 foreach (var group in duplicateGroups)
                 {
+                    // Prioritize preserving:
+                    // 1. Entity that has an existing thumbnail file on disk
+                    // 2. Entity that has user customizations/tags
+                    // 3. Entity marked as favorite
+                    // 4. Lowest ID (original record)
                     var preferred = group
                         .OrderByDescending(m => File.Exists(Path.Combine(thumbDir, $"{m.Id}.thumb")))
                         .ThenByDescending(m => m.IsUserTagged || !string.IsNullOrWhiteSpace(m.UserTags))
@@ -666,6 +656,10 @@ public class PKGManager
                 }
             }
 
+            // CRITICAL SAFETY GUARD:
+            // If disk scan found 0 files, but the database already has items,
+            // DO NOT mass-delete the entire database! The folder might be unmounted,
+            // misconfigured, or temporarily unavailable.
             if (diskFileMap.Count == 0 && metaEntities.Count > 0)
             {
                 AppLogger.LogWarning($"[CheckOrphanPackages] Disk scan found 0 files in '{_options.ManagedPackageFolderPath}', but database has {metaEntities.Count} items. Aborting orphan package deletion to prevent catastrophic data loss.");

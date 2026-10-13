@@ -11,6 +11,7 @@ public class PlumbobForgeOptions
     public string LegacyPackageFolderName { get; set; } = "Legacy";
     public string TS3PackStoreFolderName { get; set; } = "Store";
     public string GameFilesDir { get; set; } = "";
+    public string Sims3UserDir { get; set; } = "";
     public int CompressionLevel { get; set; } = 1;
     public bool HasSeenWalkthrough { get; set; } = false;
     public bool HasCompletedUpgradeWizard { get; set; } = false;

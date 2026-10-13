@@ -32,6 +32,7 @@ public class CollectionIconDef
     public TGI_Key Key { get; set; } = new(0x2F7D0004, 0, 0);
     public string BoxIconKind { get; set; } = "RegularFolder";
     public byte[]? IconBytes { get; set; }
+    public bool IsCustom { get; set; } = false;
 }
 
 public class CollectionSetOption
