@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -215,6 +216,7 @@ public class Sims3CollectionService
     public async Task<List<CollectionModel>> LoadUserCollectionsAsync(CancellationToken cancellationToken = default)
     {
         var dbCollMap = new Dictionary<ulong, CollectionEntity>();
+        var setBuildBuyCounts = new Dictionary<long, int>();
         try
         {
             await EnsureDatabaseTablesAsync(cancellationToken);
@@ -224,6 +226,24 @@ public class Sims3CollectionService
                 .AsNoTracking()
                 .ToListAsync(cancellationToken);
             dbCollMap = dbCollections.ToDictionary(c => c.Id, c => c);
+
+            var rawCounts = await _db.SetsEntities
+                .AsNoTracking()
+                .Select(s => new
+                {
+                    s.Id,
+                    BuildBuyCount = s.MetaEntities.Count(m => m.Enabled && (
+                        m.PackageType == "BuildBuy" ||
+                        m.PackageType == "Build/Buy" ||
+                        m.PackageType == "Object" ||
+                        m.PackageType == "Build-Buy" ||
+                        m.PackageType == "buildbuy" ||
+                        m.PackageType == "object"
+                    ))
+                })
+                .ToListAsync(cancellationToken);
+
+            setBuildBuyCounts = rawCounts.ToDictionary(s => s.Id, s => s.BuildBuyCount);
         }
         catch (Exception ex)
         {
@@ -313,6 +333,12 @@ public class Sims3CollectionService
                         linkedSetNames = dbColl.CollectionSets.Where(cs => cs.Set != null).Select(cs => cs.Set!.Name).ToList();
                     }
 
+                    int displayItemCount = items.Count;
+                    if (isPlumbobForge && linkedSetIds.Count > 0)
+                    {
+                        displayItemCount = linkedSetIds.Sum(id => setBuildBuyCounts.TryGetValue(id, out var count) ? count : 0);
+                    }
+
                     collections.Add(new CollectionModel
                     {
                         Id = collectionId,
@@ -324,7 +350,7 @@ public class Sims3CollectionService
                         IconCategory = iconCategory,
                         IconBytes = GetIconImageBytes(iconKey),
                         Flags = flags,
-                        ItemCount = items.Count,
+                        ItemCount = displayItemCount,
                         Items = items,
                         IsPlumbobForge = isPlumbobForge,
                         HideFromCatalog = hideFromCatalog,
@@ -345,26 +371,40 @@ public class Sims3CollectionService
 
     public async Task<List<CollectionSetOption>> GetAvailableSetOptionsAsync(CancellationToken cancellationToken = default)
     {
-        var sets = await _db.SetsEntities
+        var rawSets = await _db.SetsEntities
             .AsNoTracking()
-            .Include(s => s.MetaEntities)
+            .Select(s => new
+            {
+                s.Id,
+                s.Name,
+                s.ParentSetsEntityId,
+                s.Icon,
+                s.Color,
+                ItemCount = s.MetaEntities.Count(m => m.Enabled && (
+                    m.PackageType == "BuildBuy" ||
+                    m.PackageType == "Build/Buy" ||
+                    m.PackageType == "Object" ||
+                    m.PackageType == "Build-Buy" ||
+                    m.PackageType == "buildbuy" ||
+                    m.PackageType == "object"
+                ))
+            })
             .ToListAsync(cancellationToken);
 
-        var setsById = sets.ToDictionary(s => s.Id);
+        var setsById = rawSets.ToDictionary(s => s.Id);
 
-        string BuildBreadcrumb(SetsEntity set)
+        string BuildBreadcrumb(long? parentId)
         {
             var ancestors = new List<string>();
-            long? currentParentId = set.ParentSetsEntityId;
             var visited = new HashSet<long>();
 
-            while (currentParentId.HasValue && !visited.Contains(currentParentId.Value))
+            while (parentId.HasValue && !visited.Contains(parentId.Value))
             {
-                visited.Add(currentParentId.Value);
-                if (setsById.TryGetValue(currentParentId.Value, out var parent))
+                visited.Add(parentId.Value);
+                if (setsById.TryGetValue(parentId.Value, out var parent))
                 {
                     ancestors.Insert(0, parent.Name);
-                    currentParentId = parent.ParentSetsEntityId;
+                    parentId = parent.ParentSetsEntityId;
                 }
                 else
                 {
@@ -375,21 +415,16 @@ public class Sims3CollectionService
             return ancestors.Count > 0 ? string.Join("  ›  ", ancestors) : string.Empty;
         }
 
-        return sets
+        return rawSets
             .OrderBy(s => s.Name)
             .Select(s => new CollectionSetOption
             {
                 SetId = s.Id,
                 SetName = s.Name,
-                BreadcrumbPath = BuildBreadcrumb(s),
+                BreadcrumbPath = BuildBreadcrumb(s.ParentSetsEntityId),
                 Icon = string.IsNullOrWhiteSpace(s.Icon) ? "RegularFolder" : s.Icon,
                 Color = string.IsNullOrWhiteSpace(s.Color) ? null : s.Color,
-                ItemCount = s.MetaEntities.Count(m => m.Enabled && (
-                    string.Equals(m.PackageType, "BuildBuy", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(m.PackageType, "Build/Buy", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(m.PackageType, "Object", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(m.PackageType, "Build-Buy", StringComparison.OrdinalIgnoreCase)
-                )),
+                ItemCount = s.ItemCount,
                 IsSelected = false
             })
             .ToList();
@@ -483,40 +518,79 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
             AddDescendants(id);
         }
 
-        // Query items from selected sets
+        // Query items from selected sets (only build/buy items needed)
         var metaItems = await _db.MetaEntities
             .AsNoTracking()
-            .Where(m => m.SetsEntityId.HasValue && allSelectedSetIds.Contains(m.SetsEntityId.Value))
+            .Where(m => m.SetsEntityId.HasValue && allSelectedSetIds.Contains(m.SetsEntityId.Value) && m.Enabled && (
+                m.PackageType == "BuildBuy" ||
+                m.PackageType == "Build/Buy" ||
+                m.PackageType == "Object" ||
+                m.PackageType == "Build-Buy" ||
+                m.PackageType == "buildbuy" ||
+                m.PackageType == "object"
+            ))
+            .Select(m => new { m.FileName, m.CompleteFileName })
             .ToListAsync(cancellationToken);
 
-        var itemKeys = new Dictionary<TGI_Key, uint>();
+        var itemKeys = new ConcurrentDictionary<TGI_Key, uint>();
+        string managedPkgFolder = _optionsMonitor.CurrentValue.ManagedPackageFolderPath ?? "";
 
-        foreach (var item in metaItems)
+        await Task.Run(() =>
         {
-            if (cancellationToken.IsCancellationRequested) break;
-
-            string filePath = item.CompleteFileName;
-            if (!File.Exists(filePath))
+            var pOptions = new ParallelOptions
             {
-                string fallback = Path.Combine(_optionsMonitor.CurrentValue.ManagedPackageFolderPath, item.FileName);
-                if (File.Exists(fallback))
-                {
-                    filePath = fallback;
-                }
-                else
-                {
-                    continue;
-                }
-            }
+                MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount),
+                CancellationToken = cancellationToken
+            };
 
-            try
+            Parallel.ForEach(metaItems, pOptions, item =>
             {
-                if (item.FileName.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase))
+                if (cancellationToken.IsCancellationRequested) return;
+
+                string filePath = item.CompleteFileName;
+                if (!File.Exists(filePath))
                 {
-                    using var s3p = new Sims3Pack(filePath);
-                    foreach (var package in s3p.Packages)
+                    string fallback = Path.Combine(managedPkgFolder, item.FileName);
+                    if (File.Exists(fallback))
                     {
-                        var objdKeys = package.Resources
+                        filePath = fallback;
+                    }
+                    else
+                    {
+                        return;
+                    }
+                }
+
+                try
+                {
+                    if (item.FileName.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase))
+                    {
+                        using var s3p = new Sims3Pack(filePath);
+                        foreach (var package in s3p.Packages)
+                        {
+                            var objdKeys = package.Resources
+                                .Where(r => r.Key.Type == 0x319E4F1D)
+                                .Select(r => r.Key)
+                                .ToList();
+
+                            if (objdKeys.Count > 0)
+                            {
+                                foreach (var key in objdKeys)
+                                {
+                                    itemKeys.TryAdd(key, 32767u);
+                                }
+                            }
+                            else if (package.Resources.Count > 0)
+                            {
+                                var firstKey = package.Resources[0].Key;
+                                itemKeys.TryAdd(firstKey, 32767u);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        using var pkg = new DBPFPackage(filePath);
+                        var objdKeys = pkg.Resources
                             .Where(r => r.Key.Type == 0x319E4F1D)
                             .Select(r => r.Key)
                             .ToList();
@@ -525,103 +599,73 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
                         {
                             foreach (var key in objdKeys)
                             {
-                                if (!itemKeys.ContainsKey(key))
-                                {
-                                    itemKeys[key] = 32767u;
-                                }
+                                itemKeys.TryAdd(key, 32767u);
                             }
                         }
-                        else if (package.Resources.Count > 0)
+                        else if (pkg.Resources.Count > 0)
                         {
-                            var firstKey = package.Resources[0].Key;
-                            if (!itemKeys.ContainsKey(firstKey))
-                            {
-                                itemKeys[firstKey] = 32767u;
-                            }
+                            var firstKey = pkg.Resources[0].Key;
+                            itemKeys.TryAdd(firstKey, 32767u);
                         }
                     }
                 }
-                else
+                catch (Exception ex)
                 {
-                    using var pkg = new DBPFPackage(filePath);
-                    var objdKeys = pkg.Resources
-                        .Where(r => r.Key.Type == 0x319E4F1D)
-                        .Select(r => r.Key)
-                        .ToList();
-
-                    if (objdKeys.Count > 0)
-                    {
-                        foreach (var key in objdKeys)
-                        {
-                            if (!itemKeys.ContainsKey(key))
-                            {
-                                itemKeys[key] = 32767u;
-                            }
-                        }
-                    }
-                    else if (pkg.Resources.Count > 0)
-                    {
-                        var firstKey = pkg.Resources[0].Key;
-                        if (!itemKeys.ContainsKey(firstKey))
-                        {
-                            itemKeys[firstKey] = 32767u;
-                        }
-                    }
+                    log.Warn($"Error extracting object keys from '{filePath}': {ex.Message}");
                 }
-            }
-            catch (Exception ex)
-            {
-                log.Warn($"Error extracting object keys from '{filePath}': {ex.Message}");
-            }
-        }
-
-        // Encode 0x0C07456D (201803117u) binary resource
-        byte[] resourceBytes;
-        using (var ms = new MemoryStream())
-        using (var writer = new BinaryWriter(ms))
-        {
-            writer.Write(1u); // version = 1
-            writer.Write((uint)name.Length);
-            writer.Write(Encoding.Unicode.GetBytes(name));
-            writer.Write(0u); // flags
-            writer.Write(iconKey.Type);
-            writer.Write(iconKey.Group);
-            writer.Write(iconKey.Instance);
-            writer.Write((uint)itemKeys.Count);
-
-            foreach (var kvp in itemKeys)
-            {
-                writer.Write(kvp.Key.Type);
-                writer.Write(kvp.Key.Group);
-                writer.Write(kvp.Key.Instance);
-                writer.Write(kvp.Value);
-            }
-
-            resourceBytes = ms.ToArray();
-        }
+            });
+        }, cancellationToken);
 
         // Build package file
         string tempFile = targetPath + ".tmp";
         try
         {
-            if (File.Exists(tempFile)) File.Delete(tempFile);
-
-            using (var builder = new DBPFPackageBuilder(tempFile, false))
+            await Task.Run(() =>
             {
-                using var ms = new MemoryStream(resourceBytes, writable: false);
-                var entry = new ResourceEntry(ms, new TGI_Key(0x0C07456D, 0, finalId));
-                builder.AddResource(entry);
+                if (File.Exists(tempFile)) File.Delete(tempFile);
 
-                // If icon bytes are in cache (custom icons or preloaded game icons), also embed image resource
-                if (_iconBytesCache.TryGetValue(iconKey, out var iconBytes) && iconBytes != null && iconBytes.Length > 0)
+                // Encode 0x0C07456D (201803117u) binary resource
+                byte[] resourceBytes;
+                using (var ms = new MemoryStream())
+                using (var writer = new BinaryWriter(ms))
                 {
-                    using var iconMs = new MemoryStream(iconBytes, writable: false);
-                    builder.AddResource(new ResourceEntry(iconMs, iconKey));
-                }
-            }
+                    writer.Write(1u); // version = 1
+                    writer.Write((uint)name.Length);
+                    writer.Write(Encoding.Unicode.GetBytes(name));
+                    writer.Write(0u); // flags
+                    writer.Write(iconKey.Type);
+                    writer.Write(iconKey.Group);
+                    writer.Write(iconKey.Instance);
+                    writer.Write((uint)itemKeys.Count);
 
-            if (File.Exists(targetPath)) File.Delete(targetPath);
-            File.Move(tempFile, targetPath);
+                    foreach (var kvp in itemKeys)
+                    {
+                        writer.Write(kvp.Key.Type);
+                        writer.Write(kvp.Key.Group);
+                        writer.Write(kvp.Key.Instance);
+                        writer.Write(kvp.Value);
+                    }
+
+                    resourceBytes = ms.ToArray();
+                }
+
+                using (var builder = new DBPFPackageBuilder(tempFile, false))
+                {
+                    using var ms = new MemoryStream(resourceBytes, writable: false);
+                    var entry = new ResourceEntry(ms, new TGI_Key(0x0C07456D, 0, finalId));
+                    builder.AddResource(entry);
+
+                    // If icon bytes are in cache (custom icons or preloaded game icons), also embed image resource
+                    if (_iconBytesCache.TryGetValue(iconKey, out var iconBytes) && iconBytes != null && iconBytes.Length > 0)
+                    {
+                        using var iconMs = new MemoryStream(iconBytes, writable: false);
+                        builder.AddResource(new ResourceEntry(iconMs, iconKey));
+                    }
+                }
+
+                if (File.Exists(targetPath)) File.Delete(targetPath);
+                File.Move(tempFile, targetPath);
+            }, cancellationToken);
 
             // Persist to Database as a PlumbobForge-managed collection
             var dbColl = await _db.Collections.Include(c => c.CollectionSets).FirstOrDefaultAsync(c => c.Id == finalId, cancellationToken);
@@ -678,7 +722,7 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
             result.Success = true;
             result.CollectionId = finalId;
             result.FilePath = targetPath;
-            result.ItemCount = itemKeys.Count;
+            result.ItemCount = metaItems.Count;
         }
         catch (Exception ex)
         {
