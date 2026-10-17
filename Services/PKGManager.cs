@@ -274,7 +274,8 @@ public class PKGManager
                     InstallDate = DateTime.Now.ToString(),
                     Manifest = string.Empty,
                     Enabled = true,
-                    FileSize = currentSizeKb
+                    FileSize = currentSizeKb,
+                    Filehash = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}"
                 };
 
                 if (tombstone != null)
@@ -291,6 +292,7 @@ public class PKGManager
             else
             {
                 existingMeta.FileSize = currentSizeKb;
+                existingMeta.Filehash = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}";
                 existingMeta.CompleteFileName = filePath;
                 if (existingMeta.SetsEntity != null) existingMeta.SetsEntity.Dirty = true;
                 result.Add(existingMeta);
@@ -728,7 +730,8 @@ public class PKGManager
                         InstallDate = DateTime.Now.ToString(),
                         Manifest = string.Empty,
                         Enabled = true,
-                        FileSize = currentSizeKb
+                        FileSize = currentSizeKb,
+                        Filehash = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}"
                     };
 
                     if (tombstone != null)
@@ -749,10 +752,18 @@ public class PKGManager
                 else
                 {
                     bool isSims3Pack = Path.GetExtension(fileName).Equals(".sims3pack", StringComparison.OrdinalIgnoreCase);
+                    string currentSig = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}";
                     bool sizeChanged = Math.Abs(existingMeta.FileSize - currentSizeKb) > 0.01;
+                    bool pathChanged = existingMeta.CompleteFileName != filePath;
+                    bool sigChanged = !string.IsNullOrEmpty(existingMeta.Filehash) && existingMeta.Filehash != currentSig;
 
-                    if (sizeChanged || existingMeta.CompleteFileName != filePath)
+                    if (sigChanged || sizeChanged || pathChanged)
                     {
+                        if (sigChanged || sizeChanged)
+                        {
+                            _thumbnailService.DeleteThumbnail(existingMeta.Id);
+                        }
+
                         (string PackageType, string CASCategories, string CASAge, string CASGender, string CASOutfitCategory) typeInfo = ("Other", "", "", "", "");
                         try
                         {
@@ -760,7 +771,7 @@ public class PKGManager
                         }
                         catch { /* Ignore lock/read error on raw scan */ }
 
-                        existingMeta.FileType = isSims3Pack ? "TS3PACK" : "DBPF";
+                        existingMeta.FileType = isSims3Pack ? "TS3PACK" : fileName.EndsWith(".world", StringComparison.OrdinalIgnoreCase) ? "WORLD" : fileName.EndsWith(".sim", StringComparison.OrdinalIgnoreCase) ? "SIM" : "DBPF";
                         if (!existingMeta.IsUserTagged)
                         {
                             existingMeta.PackageType = typeInfo.PackageType;
@@ -771,6 +782,7 @@ public class PKGManager
                         }
                         existingMeta.CompleteFileName = filePath;
                         existingMeta.FileSize = currentSizeKb;
+                        existingMeta.Filehash = currentSig;
                         existingMeta.InstallDate = DateTime.Now.ToString();
 
                         if (existingMeta.SetsEntity != null)
@@ -782,6 +794,11 @@ public class PKGManager
                             existingMeta.SetsEntity = assignSet;
                             assignSet.Dirty = true;
                         }
+                        metaAddedOrUpdated = true;
+                    }
+                    else if (string.IsNullOrEmpty(existingMeta.Filehash))
+                    {
+                        existingMeta.Filehash = currentSig;
                         metaAddedOrUpdated = true;
                     }
                 }
@@ -874,6 +891,51 @@ public class PKGManager
         => _cacheBuilderService.RebuildSet(activeSet, onProgress, skippedFiles, progress, stepId, totalItems);
 
     public async Task<string?> GetThumbnailPathAsync(long itemId) => await _thumbnailService.GetThumbnailPathAsync(itemId);
+
+    public async Task<bool> RefreshItemAsync(long itemId)
+    {
+        var meta = await _db.MetaEntities.FindAsync(itemId);
+        if (meta == null || !File.Exists(meta.CompleteFileName)) return false;
+
+        var fileInfo = new FileInfo(meta.CompleteFileName);
+        double currentSizeKb = fileInfo.Length / 1024.0;
+        string currentSig = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}";
+        bool isSims3Pack = Path.GetExtension(meta.FileName).Equals(".sims3pack", StringComparison.OrdinalIgnoreCase);
+
+        _thumbnailService.DeleteThumbnail(meta.Id);
+
+        (string PackageType, string CASCategories, string CASAge, string CASGender, string CASOutfitCategory) typeInfo = ("Other", "", "", "", "");
+        try
+        {
+            typeInfo = DetectPackageType(meta.CompleteFileName, isSims3Pack);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.LogWarning($"Failed to detect package type during refresh for {meta.CompleteFileName}", ex, "PKGManager");
+        }
+
+        meta.FileType = isSims3Pack ? "TS3PACK" : meta.FileName.EndsWith(".world", StringComparison.OrdinalIgnoreCase) ? "WORLD" : meta.FileName.EndsWith(".sim", StringComparison.OrdinalIgnoreCase) ? "SIM" : "DBPF";
+        if (!meta.IsUserTagged)
+        {
+            meta.PackageType = typeInfo.PackageType;
+            meta.CASCategories = typeInfo.CASCategories;
+            meta.CASAge = typeInfo.CASAge;
+            meta.CASGender = typeInfo.CASGender;
+            meta.CASOutfitCategory = typeInfo.CASOutfitCategory;
+        }
+        meta.FileSize = currentSizeKb;
+        meta.Filehash = currentSig;
+
+        await _thumbnailService.GetThumbnailPathAsync(meta.Id);
+
+        if (meta.SetsEntity != null)
+        {
+            meta.SetsEntity.Dirty = true;
+        }
+
+        await _db.SaveChangesAsync();
+        return true;
+    }
 
     public (string PackageType, string CASCategories, string CASAge, string CASGender, string CASOutfitCategory) DetectPackageType(string filePath, bool isSims3Pack)
         => _packageTypeService.DetectPackageType(filePath, isSims3Pack);

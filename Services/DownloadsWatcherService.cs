@@ -188,12 +188,14 @@ public class DownloadsWatcherService : BackgroundService
                     }
                 }
 
-                // Defer background auto-scan check so UI launch and first render complete unhindered
-                _ = Task.Run(async () =>
+                if (updatedOptions != null)
                 {
-                    await Task.Delay(4000);
-                    await TriggerAutoImportAsync("Observed folders updated");
-                });
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(2000);
+                        await TriggerAutoImportAsync("Observed folders updated");
+                    });
+                }
             }
             else
             {
@@ -284,7 +286,7 @@ public class DownloadsWatcherService : BackgroundService
             {
                 try
                 {
-                    await Task.Delay(400, token);
+                    await Task.Delay(600, token);
                     if (token.IsCancellationRequested) return;
 
                     await ExecuteLibraryScanWithCoalescingAsync();

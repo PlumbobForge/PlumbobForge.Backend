@@ -30,6 +30,8 @@ public class ThumbnailService
         return thumbDir;
     }
 
+    public static event Action<long>? ThumbnailDeleted;
+
     public void DeleteThumbnail(long itemId)
     {
         try
@@ -40,6 +42,8 @@ public class ThumbnailService
 
             if (File.Exists(thumbPath)) File.Delete(thumbPath);
             if (File.Exists(noThumbPath)) File.Delete(noThumbPath);
+
+            ThumbnailDeleted?.Invoke(itemId);
         }
         catch { }
     }
@@ -125,7 +129,7 @@ public class ThumbnailService
         return best;
     }
 
-    public async Task<string?> GetThumbnailPathAsync(long itemId)
+    public async Task<string?> GetThumbnailPathAsync(long itemId, string? completeFileName = null)
     {
         string thumbDir = GetThumbnailDirectory();
         string thumbPath = Path.Combine(thumbDir, $"{itemId}.thumb");
@@ -141,14 +145,19 @@ public class ThumbnailService
             return null;
         }
 
-        var item = await _db.MetaEntities.FindAsync(itemId);
-        if (item == null || !File.Exists(item.CompleteFileName)) return null;
+        string? filePath = completeFileName;
+        if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
+        {
+            var item = await _db.MetaEntities.AsNoTracking().FirstOrDefaultAsync(m => m.Id == itemId);
+            if (item == null || !File.Exists(item.CompleteFileName)) return null;
+            filePath = item.CompleteFileName;
+        }
 
         try
         {
-            if (item.FileName.ToLower().EndsWith(".sims3pack"))
+            if (filePath.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase))
             {
-                using var sims3Pack = new Sims3Pack(item.CompleteFileName);
+                using var sims3Pack = new Sims3Pack(filePath);
                 if (sims3Pack.Thumbnails != null && sims3Pack.Thumbnails.Count > 0)
                 {
                     using var firstThumb = sims3Pack.Thumbnails[0];
@@ -181,7 +190,7 @@ public class ThumbnailService
             }
             else
             {
-                using var package = new DBPFPackage(item.CompleteFileName);
+                using var package = new DBPFPackage(filePath);
                 var res = FindBestThumbnail(package);
 
                 if (res != null)
@@ -194,7 +203,8 @@ public class ThumbnailService
         }
         catch (Exception ex)
         {
-            AppLogger.LogWarning($"Error extracting thumbnail from {item.CompleteFileName}", ex, "ThumbnailService");
+            AppLogger.LogWarning($"Error extracting thumbnail from {filePath}", ex, "ThumbnailService");
+            return null;
         }
 
         // Negative-cache marker: package has no thumbnail
