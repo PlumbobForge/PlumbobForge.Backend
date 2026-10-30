@@ -80,6 +80,27 @@ public class Sims3HiderService
         return false;
     }
 
+    public async Task RefreshHidersForSetsAsync(IEnumerable<long> setIds, CancellationToken cancellationToken = default)
+    {
+        var changedSetIds = setIds.ToHashSet();
+        if (changedSetIds.Count == 0) return;
+
+        var collections = await _db.Collections
+            .AsNoTracking()
+            .Include(c => c.CollectionSets)
+            .Where(c => c.HideFromCatalog)
+            .ToListAsync(cancellationToken);
+
+        foreach (var collection in collections)
+        {
+            var includedSetIds = collection.CollectionSets.Select(cs => cs.SetsEntityId).ToList();
+            var allSetIds = await SetHierarchyHelper.GetAllDescendantSetIdsAsync(_db, includedSetIds, cancellationToken);
+            if (!allSetIds.Any(changedSetIds.Contains)) continue;
+
+            await GenerateHiderPackageAsync(collection.Id, collection.Name, includedSetIds, cancellationToken);
+        }
+    }
+
     public async Task<HiderGenerationResult> GenerateHiderPackageAsync(
         ulong collectionId,
         string collectionName,
@@ -106,30 +127,12 @@ public class Sims3HiderService
         result.FilePath = targetPath;
 
         var setIdsList = includedSetIds?.Distinct().ToList() ?? new List<long>();
-        var allSelectedSetIds = new HashSet<long>(setIdsList);
+        var allSelectedSetIds = await SetHierarchyHelper.GetAllDescendantSetIdsAsync(_db, setIdsList, cancellationToken);
 
-        // Include child sets recursively
-        var allSets = await _db.SetsEntities.AsNoTracking().ToListAsync(cancellationToken);
-        void AddDescendants(long parentId)
-        {
-            var children = allSets.Where(s => s.ParentSetsEntityId == parentId).Select(s => s.Id);
-            foreach (var childId in children)
-            {
-                if (allSelectedSetIds.Add(childId))
-                {
-                    AddDescendants(childId);
-                }
-            }
-        }
-        foreach (var id in setIdsList)
-        {
-            AddDescendants(id);
-        }
-
-        // Query items from selected sets
+        // Query enabled items from selected sets (a disabled mod's objects are not in the game to hide)
         var metaItems = await _db.MetaEntities
             .AsNoTracking()
-            .Where(m => m.SetsEntityId.HasValue && allSelectedSetIds.Contains(m.SetsEntityId.Value))
+            .Where(m => m.Enabled && m.SetsEntityId.HasValue && allSelectedSetIds.Contains(m.SetsEntityId.Value))
             .ToListAsync(cancellationToken);
 
         var modifiedObjds = new Dictionary<TGI_Key, byte[]>();
@@ -140,6 +143,8 @@ public class Sims3HiderService
             if (cancellationToken.IsCancellationRequested) break;
 
             string filePath = item.CompleteFileName;
+            // A vault item's chunk offsets only make sense inside its own shard, so never fall back to a library file.
+            if (item.IsVaultManaged && !File.Exists(filePath)) continue;
             if (!File.Exists(filePath))
             {
                 string fallback = Path.Combine(_optionsMonitor.CurrentValue.ManagedPackageFolderPath, item.FileName);
@@ -155,13 +160,32 @@ public class Sims3HiderService
 
             try
             {
-                if (item.FileName.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase))
+                if (item.IsVaultManaged)
+                {
+                    var objdChunks = await _db.VaultChunks
+                        .AsNoTracking()
+                        .Where(c => c.MetaEntityId == item.Id && c.Type == PackageTypeHelper.TypeOBJD)
+                        .ToListAsync(cancellationToken);
+
+                    foreach (var chunk in objdChunks)
+                    {
+                        byte[] rawBytes = S3ForgeTools.GameFiles.Package.DBPFVaultShard.ReadDecompressedChunk(
+                            filePath, chunk.Offset, chunk.ChunkLength, chunk.ResourceLength, chunk.IsCompressed);
+
+                        if (TryModifyObjdToHidden(rawBytes, out byte[] modifiedBytes, out ulong guid))
+                        {
+                            modifiedObjds[new TGI_Key(chunk.Type, chunk.Group, chunk.Instance)] = modifiedBytes;
+                            if (guid != 0) objectGuids.Add(guid);
+                        }
+                    }
+                }
+                else if (item.FileName.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase))
                 {
                     using var s3p = new Sims3Pack(filePath);
                     foreach (var package in s3p.Packages)
                     {
                         var objdEntries = package.Resources
-                            .Where(r => r.Key.Type == 0x319E4F1D)
+                            .Where(r => r.Key.Type == PackageTypeHelper.TypeOBJD)
                             .ToList();
 
                         foreach (var entry in objdEntries)
@@ -179,7 +203,7 @@ public class Sims3HiderService
                 {
                     using var pkg = new DBPFPackage(filePath);
                     var objdEntries = pkg.Resources
-                        .Where(r => r.Key.Type == 0x319E4F1D)
+                        .Where(r => r.Key.Type == PackageTypeHelper.TypeOBJD)
                         .ToList();
 
                     foreach (var entry in objdEntries)
@@ -245,10 +269,6 @@ public class Sims3HiderService
         return result;
     }
 
-    /// <summary>
-    /// Modifies the OBJD using s3pi ObjectCatalogResource to set BuildBuyProductStatusFlags = 0x60 (Hidden from Buy & Build catalog)
-    /// while preserving all other object fields, thumbnails, and material data intact.
-    /// </summary>
     public static bool TryModifyObjdToHidden(byte[] rawBytes, out byte[] modifiedBytes, out ulong guid)
     {
         modifiedBytes = Array.Empty<byte>();
@@ -283,9 +303,6 @@ public class Sims3HiderService
         }
     }
 
-    /// <summary>
-    /// Generates Batch Resource Editor / Cardinal compatible XML string.
-    /// </summary>
     public string GenerateHiderXml(string collectionName, IEnumerable<ulong> guids)
     {
         var doc = new XDocument(

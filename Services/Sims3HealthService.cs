@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
@@ -415,7 +415,7 @@ public class Sims3HealthService
                     uint instLo = (indexType & 8) != 0 ? constInstLo : BinaryPrimitives.ReadUInt32LittleEndian(indexSpan.Slice(pos, 4));
                     if ((indexType & 8) == 0) pos += 4;
 
-                    ulong instance = instLo | ((ulong)instInstLo(instHi, instLo));
+                    ulong instance = ((ulong)instHi << 32) | instLo;
 
                     pos += 16;
 
@@ -441,7 +441,7 @@ public class Sims3HealthService
             return false;
         }
 
-        static ulong instInstLo(uint hi, uint lo) => lo | ((ulong)hi << 32);
+
     }
 
     public async Task<HealthScanSummary> ScanLibraryConflictsAsync(
@@ -830,7 +830,7 @@ public class Sims3HealthService
                 });
             }
 
-            cards.AddRange(corruptCards);
+
             cards = cards
                 .OrderBy(card => card.Category switch
                 {
@@ -851,7 +851,7 @@ public class Sims3HealthService
 
             progress?.CompleteStep("analyze_conflicts", finalBadge: $"{summary.TotalIssuesCount} issue cards found");
 
-            GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+
 
             return summary;
         }, cancellationToken);

@@ -32,6 +32,7 @@ public class Sims3CollectionService
     private static readonly List<CollectionIconDef> _customIcons = new();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<TGI_Key, byte[]> _iconBytesCache = new();
     private static bool _hasPreloadedIcons = false;
+    private static bool _tablesEnsured = false;
     private static readonly object _iconPreloadLock = new();
 
     public Sims3CollectionService(
@@ -232,14 +233,7 @@ public class Sims3CollectionService
                 .Select(s => new
                 {
                     s.Id,
-                    BuildBuyCount = s.MetaEntities.Count(m => m.Enabled && (
-                        m.PackageType == "BuildBuy" ||
-                        m.PackageType == "Build/Buy" ||
-                        m.PackageType == "Object" ||
-                        m.PackageType == "Build-Buy" ||
-                        m.PackageType == "buildbuy" ||
-                        m.PackageType == "object"
-                    ))
+                    BuildBuyCount = s.MetaEntities.Count(m => m.Enabled && PackageTypeHelper.BuildBuyTypes.Contains(m.PackageType))
                 })
                 .ToListAsync(cancellationToken);
 
@@ -380,14 +374,7 @@ public class Sims3CollectionService
                 s.ParentSetsEntityId,
                 s.Icon,
                 s.Color,
-                ItemCount = s.MetaEntities.Count(m => m.Enabled && (
-                    m.PackageType == "BuildBuy" ||
-                    m.PackageType == "Build/Buy" ||
-                    m.PackageType == "Object" ||
-                    m.PackageType == "Build-Buy" ||
-                    m.PackageType == "buildbuy" ||
-                    m.PackageType == "object"
-                ))
+                ItemCount = s.MetaEntities.Count(m => m.Enabled && PackageTypeHelper.BuildBuyTypes.Contains(m.PackageType))
             })
             .ToListAsync(cancellationToken);
 
@@ -432,6 +419,7 @@ public class Sims3CollectionService
 
     private async Task EnsureDatabaseTablesAsync(CancellationToken cancellationToken = default)
     {
+        if (_tablesEnsured) return;
         try
         {
             await _db.Database.ExecuteSqlRawAsync(@"
@@ -455,6 +443,7 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
     FOREIGN KEY (SetsEntityId) REFERENCES SetsEntities(Id) ON DELETE CASCADE
 );", cancellationToken);
             try { await _db.Database.ExecuteSqlRawAsync("ALTER TABLE Collections ADD COLUMN HideFromCatalog INTEGER NOT NULL DEFAULT 0;", cancellationToken); } catch { }
+            _tablesEnsured = true;
         }
         catch { }
     }
@@ -498,41 +487,34 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
         string targetPath = Path.Combine(folder, fileName);
 
         var setIdsList = includedSetIds?.Distinct().ToList() ?? new List<long>();
-        var allSelectedSetIds = new HashSet<long>(setIdsList);
-
-        // Include child sets recursively
-        var allSets = await _db.SetsEntities.AsNoTracking().ToListAsync(cancellationToken);
-        void AddDescendants(long parentId)
-        {
-            var children = allSets.Where(s => s.ParentSetsEntityId == parentId).Select(s => s.Id);
-            foreach (var childId in children)
-            {
-                if (allSelectedSetIds.Add(childId))
-                {
-                    AddDescendants(childId);
-                }
-            }
-        }
-        foreach (var id in setIdsList)
-        {
-            AddDescendants(id);
-        }
+        var allSelectedSetIds = await SetHierarchyHelper.GetAllDescendantSetIdsAsync(_db, setIdsList, cancellationToken);
 
         // Query items from selected sets (only build/buy items needed)
         var metaItems = await _db.MetaEntities
             .AsNoTracking()
-            .Where(m => m.SetsEntityId.HasValue && allSelectedSetIds.Contains(m.SetsEntityId.Value) && m.Enabled && (
-                m.PackageType == "BuildBuy" ||
-                m.PackageType == "Build/Buy" ||
-                m.PackageType == "Object" ||
-                m.PackageType == "Build-Buy" ||
-                m.PackageType == "buildbuy" ||
-                m.PackageType == "object"
-            ))
-            .Select(m => new { m.FileName, m.CompleteFileName })
+            .Where(m => m.SetsEntityId.HasValue && allSelectedSetIds.Contains(m.SetsEntityId.Value) && m.Enabled && PackageTypeHelper.BuildBuyTypes.Contains(m.PackageType))
+            .Select(m => new { m.Id, m.FileName, m.CompleteFileName, m.IsVaultManaged })
             .ToListAsync(cancellationToken);
 
         var itemKeys = new ConcurrentDictionary<TGI_Key, uint>();
+
+        var vaultItems = metaItems.Where(m => m.IsVaultManaged).ToList();
+        if (vaultItems.Count > 0)
+        {
+            var vaultIds = vaultItems.Select(v => v.Id).ToList();
+            var vaultObjdChunks = await _db.VaultChunks
+                .AsNoTracking()
+                .Where(c => vaultIds.Contains(c.MetaEntityId) && c.Type == PackageTypeHelper.TypeOBJD)
+                .Select(c => new TGI_Key(c.Type, c.Group, c.Instance))
+                .ToListAsync(cancellationToken);
+
+            foreach (var key in vaultObjdChunks)
+            {
+                itemKeys.TryAdd(key, 32767u);
+            }
+        }
+
+        var looseItems = metaItems.Where(m => !m.IsVaultManaged).ToList();
         string managedPkgFolder = _optionsMonitor.CurrentValue.ManagedPackageFolderPath ?? "";
 
         await Task.Run(() =>
@@ -543,7 +525,7 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
                 CancellationToken = cancellationToken
             };
 
-            Parallel.ForEach(metaItems, pOptions, item =>
+            Parallel.ForEach(looseItems, pOptions, item =>
             {
                 if (cancellationToken.IsCancellationRequested) return;
 
@@ -569,7 +551,7 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
                         foreach (var package in s3p.Packages)
                         {
                             var objdKeys = package.Resources
-                                .Where(r => r.Key.Type == 0x319E4F1D)
+                                .Where(r => r.Key.Type == PackageTypeHelper.TypeOBJD)
                                 .Select(r => r.Key)
                                 .ToList();
 
@@ -591,7 +573,7 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
                     {
                         using var pkg = new DBPFPackage(filePath);
                         var objdKeys = pkg.Resources
-                            .Where(r => r.Key.Type == 0x319E4F1D)
+                            .Where(r => r.Key.Type == PackageTypeHelper.TypeOBJD)
                             .Select(r => r.Key)
                             .ToList();
 
