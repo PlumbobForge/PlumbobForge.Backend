@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -42,6 +43,7 @@ public class ThumbnailService
 
             if (File.Exists(thumbPath)) File.Delete(thumbPath);
             if (File.Exists(noThumbPath)) File.Delete(noThumbPath);
+            TryDelete(Path.Combine(thumbDir, $"{itemId}.fallback"));
 
             ThumbnailDeleted?.Invoke(itemId);
         }
@@ -94,39 +96,136 @@ public class ThumbnailService
     }
 
     private static readonly uint[] ValidThumbTypes = new uint[] {
-        0x626F60CC, 0x626F60CD, 0x626F60CE, // Custom thumbnails (highest priority)
-        0x2E75C765, 0x2E75C764, 0x2E75C766, // Auto-generated CAS / Object thumbnails
-        0x0B202AD9, // THUM
-        0x0580A2B4, 0x0580A2B5, 0x0580A2B6 // Other UI thumbnails
+        0x626F60CC, 0x626F60CD, 0x626F60CE, // CAS part thumbnails, small / medium / large (highest priority)
+        0x0B202AD9, // Listed as THUM before; not in the published type tables
+        0x0580A2B4, 0x0580A2B5, 0x0580A2B6, // Object thumbnails
+        Sims3ResourceTypes.ThumbFence + 1, Sims3ResourceTypes.ThumbFence + 2, Sims3ResourceTypes.ThumbFence,
+        Sims3ResourceTypes.ThumbStairs + 1, Sims3ResourceTypes.ThumbStairs + 2, Sims3ResourceTypes.ThumbStairs,
+        Sims3ResourceTypes.ThumbRailing + 1, Sims3ResourceTypes.ThumbRailing + 2, Sims3ResourceTypes.ThumbRailing,
+        Sims3ResourceTypes.ThumbFireplace + 1, Sims3ResourceTypes.ThumbFireplace + 2, Sims3ResourceTypes.ThumbFireplace,
+        Sims3ResourceTypes.ThumbTerrainPaint + 1, Sims3ResourceTypes.ThumbTerrainPaint + 2, Sims3ResourceTypes.ThumbTerrainPaint,
+        Sims3ResourceTypes.ThumbWallFloorPattern + 1, Sims3ResourceTypes.ThumbWallFloorPattern + 2, Sims3ResourceTypes.ThumbWallFloorPattern,
+        // ICON thumbnails (catalog PNG icons) come last: the game's CAS thumbnail cache is tried before them
+        Sims3ResourceTypes.ThumbIcon + 1, Sims3ResourceTypes.ThumbIcon, Sims3ResourceTypes.ThumbIcon + 2
     };
 
-    private static ResourceEntry? FindBestThumbnail(DBPFPackage package)
+    private static readonly int FirstIconRank = ValidThumbTypes.Length - 3;
+
+    private static int ThumbRank(uint type) => Array.IndexOf(ValidThumbTypes, type);
+
+    private static bool IsIconThumb(uint type) => ThumbRank(type) >= FirstIconRank;
+
+    // Bumped when the thumbnail priority changes so previews extracted by older versions are redone once.
+    private const string PriorityVersionFile = "priority.v2";
+    // Holds the CASThumbnails.package timestamp that fallback previews were last checked against.
+    private const string GameCacheStampFile = "casthumbs.stamp";
+
+    private string? _sims3Dir;
+
+    private string GetSims3Dir() => _sims3Dir ??= Sims3PathResolver.ResolveSims3UserFolder(_options.Sims3UserDir);
+
+    private static ResourceEntry? FindBestThumbnail(IEnumerable<DBPFPackage> packages)
     {
         ResourceEntry? best = null;
         int bestPriority = int.MaxValue;
 
-        foreach (var r in package.Resources)
+        foreach (var package in packages)
         {
-            uint type = r.Key.Type;
-            for (int i = 0; i < ValidThumbTypes.Length; i++)
+            foreach (var r in package.Resources)
             {
-                if (type == ValidThumbTypes[i])
+                int i = ThumbRank(r.Key.Type);
+                if (i < 0) continue;
+                if (i == 0) // Highest priority found (custom thumbnail) - return immediately!
                 {
-                    if (i == 0) // Highest priority found (custom thumbnail) - return immediately!
-                    {
-                        return r;
-                    }
-                    if (i < bestPriority)
-                    {
-                        best = r;
-                        bestPriority = i;
-                    }
-                    break;
+                    return r;
+                }
+                if (i < bestPriority)
+                {
+                    best = r;
+                    bestPriority = i;
                 }
             }
         }
 
         return best;
+    }
+
+    private static List<ulong> CasPartInstances(IEnumerable<DBPFPackage> packages) =>
+        packages.SelectMany(p => p.Resources).Where(r => r.Key.Type == Sims3ResourceTypes.Casp).Select(r => r.Key.Instance).ToList();
+
+    private bool TrySavePreview(string thumbPath, Func<byte[]>? readEmbedded, bool embeddedIsIcon, IReadOnlyCollection<ulong> casParts)
+    {
+        string fallbackPath = Path.ChangeExtension(thumbPath, ".fallback");
+        if (readEmbedded != null && !embeddedIsIcon)
+        {
+            SaveOptimizedThumbnail(readEmbedded(), thumbPath);
+            TryDelete(fallbackPath);
+            return true;
+        }
+
+        if (casParts.Count > 0)
+        {
+            var cached = GameThumbnailCache.TryReadCasThumbnail(GetSims3Dir(), casParts);
+            if (cached != null)
+            {
+                SaveOptimizedThumbnail(cached, thumbPath);
+                TryDelete(fallbackPath);
+                return true;
+            }
+            try { File.WriteAllBytes(fallbackPath, Array.Empty<byte>()); } catch { }
+        }
+
+        if (readEmbedded == null) return false;
+        SaveOptimizedThumbnail(readEmbedded(), thumbPath);
+        return true;
+    }
+
+    private static void TryDelete(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); } catch { }
+    }
+
+    public void RefreshStalePreviews(IEnumerable<MetaEntity> items)
+    {
+        try
+        {
+            string thumbDir = GetThumbnailDirectory();
+
+            string versionPath = Path.Combine(thumbDir, PriorityVersionFile);
+            if (!File.Exists(versionPath))
+            {
+                // Sims3Pack previews come from the Sims3Pack itself and did not change.
+                foreach (var item in items)
+                {
+                    if (item.FileType == "TS3PACK") continue;
+                    if (File.Exists(Path.Combine(thumbDir, $"{item.Id}.thumb")) || File.Exists(Path.Combine(thumbDir, $"{item.Id}.nothumb")))
+                    {
+                        DeleteThumbnail(item.Id);
+                    }
+                }
+                File.WriteAllBytes(versionPath, Array.Empty<byte>());
+            }
+
+            var cacheInfo = new FileInfo(GameThumbnailCache.GetCasThumbnailsPath(GetSims3Dir()));
+            if (!cacheInfo.Exists) return;
+
+            string stampPath = Path.Combine(thumbDir, GameCacheStampFile);
+            string stamp = $"{cacheInfo.LastWriteTimeUtc.Ticks}:{cacheInfo.Length}";
+            string? previous = null;
+            try { previous = File.Exists(stampPath) ? File.ReadAllText(stampPath) : null; } catch { }
+            if (previous == stamp) return;
+
+            foreach (var marker in Directory.GetFiles(thumbDir, "*.fallback"))
+            {
+                if (long.TryParse(Path.GetFileNameWithoutExtension(marker), out var id)) DeleteThumbnail(id);
+                else TryDelete(marker);
+            }
+            File.WriteAllText(stampPath, stamp);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.LogWarning("Failed to refresh stale thumbnails", ex, "ThumbnailService");
+        }
     }
 
     public async Task<string?> GetThumbnailPathAsync(long itemId, string? completeFileName = null)
@@ -145,10 +244,59 @@ public class ThumbnailService
             return null;
         }
 
+        var item = await _db.MetaEntities.AsNoTracking().Include(m => m.VaultChunks).FirstOrDefaultAsync(m => m.Id == itemId);
+        if (item != null && item.IsVaultManaged)
+        {
+            var targetChunks = item.VaultChunks;
+            string shardFile = item.CompleteFileName;
+            if (targetChunks.Count == 0 && (item.FileType == "TS3PACK" || item.PackageType == "Sims3Pack"))
+            {
+                var firstChild = await _db.MetaEntities
+                    .AsNoTracking()
+                    .Include(m => m.VaultChunks)
+                    .FirstOrDefaultAsync(m => m.ParentMetaEntityId == item.Id && m.VaultChunks.Count > 0);
+                if (firstChild != null)
+                {
+                    targetChunks = firstChild.VaultChunks;
+                    shardFile = firstChild.CompleteFileName;
+                }
+            }
+
+            if (targetChunks.Count > 0 && File.Exists(shardFile))
+            {
+                var thumbChunk = targetChunks
+                    .Where(c => ThumbRank(c.Type) >= 0)
+                    .OrderBy(c => ThumbRank(c.Type))
+                    .FirstOrDefault();
+                var casParts = targetChunks.Where(c => c.Type == Sims3ResourceTypes.Casp).Select(c => c.Instance).ToList();
+
+                try
+                {
+                    Func<byte[]>? readEmbedded = thumbChunk == null ? null
+                        : () => DBPFVaultShard.ReadDecompressedChunk(shardFile, thumbChunk.Offset, thumbChunk.ChunkLength, thumbChunk.ResourceLength, thumbChunk.IsCompressed);
+                    if (TrySavePreview(thumbPath, readEmbedded, thumbChunk != null && IsIconThumb(thumbChunk.Type), casParts))
+                    {
+                        return thumbPath;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.LogWarning($"Error extracting thumbnail of vault item {itemId}", ex, "ThumbnailService");
+                    return null;
+                }
+
+                // The item's file is the shared shard: reading it as a package would pick another mod's thumbnail.
+                try { await File.WriteAllBytesAsync(noThumbPath, Array.Empty<byte>()); } catch { }
+                return null;
+            }
+
+            // Same for an item whose chunks are gone or whose shard is missing.
+            if (item.VaultShardId != null) return null;
+        }
+
         string? filePath = completeFileName;
         if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
         {
-            var item = await _db.MetaEntities.AsNoTracking().FirstOrDefaultAsync(m => m.Id == itemId);
             if (item == null || !File.Exists(item.CompleteFileName)) return null;
             filePath = item.CompleteFileName;
         }
@@ -176,27 +324,21 @@ public class ThumbnailService
                 }
                 else if (sims3Pack.Packages != null)
                 {
-                    foreach (var pkg in sims3Pack.Packages)
+                    var res = FindBestThumbnail(sims3Pack.Packages);
+                    if (TrySavePreview(thumbPath, res == null ? null : res.Read, res != null && IsIconThumb(res.Key.Type), CasPartInstances(sims3Pack.Packages)))
                     {
-                        var res = FindBestThumbnail(pkg);
-                        if (res != null)
-                        {
-                            var bytes = res.Read();
-                            SaveOptimizedThumbnail(bytes, thumbPath);
-                            return thumbPath;
-                        }
+                        return thumbPath;
                     }
                 }
             }
             else
             {
                 using var package = new DBPFPackage(filePath);
-                var res = FindBestThumbnail(package);
+                var packages = new[] { package };
+                var res = FindBestThumbnail(packages);
 
-                if (res != null)
+                if (TrySavePreview(thumbPath, res == null ? null : res.Read, res != null && IsIconThumb(res.Key.Type), CasPartInstances(packages)))
                 {
-                    var bytes = res.Read();
-                    SaveOptimizedThumbnail(bytes, thumbPath);
                     return thumbPath;
                 }
             }
