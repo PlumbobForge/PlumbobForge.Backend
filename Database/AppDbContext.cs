@@ -12,7 +12,11 @@ public class AppDbContext : DbContext
     public DbSet<TombstoneEntity> Tombstones { get; set; }
     public DbSet<CollectionEntity> Collections { get; set; }
     public DbSet<CollectionSetsEntity> CollectionSets { get; set; }
-    
+    public DbSet<VaultShardEntity> VaultShards { get; set; }
+    public DbSet<VaultChunkEntity> VaultChunks { get; set; }
+    public DbSet<VaultHoleEntity> VaultHoles { get; set; }
+    public DbSet<DisabledObjectEntity> DisabledObjects { get; set; }
+
     public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
 
     protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
@@ -87,5 +91,72 @@ public class AppDbContext : DbContext
             .WithMany(c => c.SettingEntities)
             .HasForeignKey(s => s.ConfigEntityId)
             .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<VaultShardEntity>()
+            .HasOne(vs => vs.SetsEntity)
+            .WithMany(s => s.VaultShards)
+            .HasForeignKey(vs => vs.SetsEntityId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<VaultShardEntity>()
+            .HasIndex(vs => new { vs.SetsEntityId, vs.ShardIndex })
+            .IsUnique();
+
+        modelBuilder.Entity<VaultChunkEntity>()
+            .HasOne(vc => vc.MetaEntity)
+            .WithMany(m => m.VaultChunks)
+            .HasForeignKey(vc => vc.MetaEntityId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<VaultChunkEntity>()
+            .HasOne(vc => vc.VaultShard)
+            .WithMany(vs => vs.Chunks)
+            .HasForeignKey(vc => vc.VaultShardId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<VaultChunkEntity>()
+            .HasIndex(vc => new { vc.Type, vc.Group, vc.Instance });
+
+        modelBuilder.Entity<VaultChunkEntity>()
+            .HasIndex(vc => vc.MetaEntityId);
+
+        modelBuilder.Entity<VaultChunkEntity>()
+            .HasIndex(vc => vc.VaultShardId);
+
+        modelBuilder.Entity<VaultHoleEntity>()
+            .HasOne(vh => vh.VaultShard)
+            .WithMany(vs => vs.Holes)
+            .HasForeignKey(vh => vh.VaultShardId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<VaultHoleEntity>()
+            .HasIndex(vh => vh.VaultShardId);
+
+        modelBuilder.Entity<MetaEntity>()
+            .HasOne(m => m.ParentMetaEntity)
+            .WithMany(p => p.SubItems)
+            .HasForeignKey(m => m.ParentMetaEntityId)
+            .OnDelete(DeleteBehavior.SetNull);
+
+        modelBuilder.Entity<MetaEntity>()
+            .HasOne(m => m.VaultShard)
+            .WithMany()
+            .HasForeignKey(m => m.VaultShardId)
+            .OnDelete(DeleteBehavior.SetNull);
+
+        modelBuilder.Entity<MetaEntity>()
+            .HasIndex(m => m.VaultShardId);
+
+        modelBuilder.Entity<MetaEntity>()
+            .HasIndex(m => m.ParentMetaEntityId);
+
+        modelBuilder.Entity<DisabledObjectEntity>()
+            .HasOne(d => d.MetaEntity)
+            .WithMany()
+            .HasForeignKey(d => d.MetaEntityId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<DisabledObjectEntity>()
+            .HasIndex(d => d.MetaEntityId);
     }
 }

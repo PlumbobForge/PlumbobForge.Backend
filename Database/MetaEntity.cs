@@ -24,9 +24,27 @@ public class MetaEntity
     public string? CASAge { get; set; }
     public string? CASGender { get; set; }
     public string? CASOutfitCategory { get; set; }
+    public string? BBKind { get; set; }
+    public string? BBRooms { get; set; }
+    public string? BBFunctions { get; set; }
+    public double? BBPriceMin { get; set; }
+    public double? BBPriceMax { get; set; }
     public bool IsUserTagged { get; set; } = false;
     public string? UserTags { get; set; }
+    public bool SkipTextureOptimization { get; set; } = false;
+    public int DisabledObjectCount { get; set; }
+    public string? DisabledObjectsStamp { get; set; }
 
     public long? SetsEntityId { get; set; }
     public SetsEntity? SetsEntity { get; set; }
+
+    public bool IsVaultManaged { get; set; } = false;
+    public long? VaultShardId { get; set; }
+    public VaultShardEntity? VaultShard { get; set; }
+
+    public long? ParentMetaEntityId { get; set; }
+    public MetaEntity? ParentMetaEntity { get; set; }
+    public ICollection<MetaEntity> SubItems { get; set; } = new List<MetaEntity>();
+
+    public ICollection<VaultChunkEntity> VaultChunks { get; set; } = new List<VaultChunkEntity>();
 }

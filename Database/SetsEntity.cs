@@ -23,4 +23,5 @@ public class SetsEntity
 
     public ICollection<SetsEntity> Children { get; set; } = new List<SetsEntity>();
     public ICollection<MetaEntity> MetaEntities { get; set; } = new List<MetaEntity>();
+    public ICollection<VaultShardEntity> VaultShards { get; set; } = new List<VaultShardEntity>();
 }

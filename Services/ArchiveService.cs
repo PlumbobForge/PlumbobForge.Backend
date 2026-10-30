@@ -29,48 +29,70 @@ public class ArchiveService
 
     public static List<string> GetArchivePackageFileNames(string archivePath)
     {
-        var names = new List<string>();
         try
         {
             using var archive = ArchiveFactory.OpenArchive(archivePath);
-            foreach (var entry in archive.Entries)
-            {
-                if (!entry.IsDirectory && !string.IsNullOrEmpty(entry.Key))
-                {
-                    string ext = Path.GetExtension(entry.Key).ToLowerInvariant();
-                    if (ext == ".package" || ext == ".sims3pack")
-                    {
-                        string? fn = Path.GetFileName(entry.Key);
-                        if (!string.IsNullOrEmpty(fn)) names.Add(fn);
-                    }
-                }
-            }
+            return ExtractPackageNames(archive);
         }
         catch { }
-        return names;
+        return new List<string>();
     }
 
     public static List<string> GetArchivePackageFileNames(Stream stream)
     {
-        var names = new List<string>();
         try
         {
             using var archive = ArchiveFactory.OpenArchive(stream);
-            foreach (var entry in archive.Entries)
+            return ExtractPackageNames(archive);
+        }
+        catch { }
+        return new List<string>();
+    }
+
+    private static List<string> ExtractPackageNames(IArchive archive)
+    {
+        var names = new List<string>();
+        foreach (var entry in archive.Entries)
+        {
+            if (!entry.IsDirectory && !string.IsNullOrEmpty(entry.Key))
             {
-                if (!entry.IsDirectory && !string.IsNullOrEmpty(entry.Key))
+                string ext = Path.GetExtension(entry.Key).ToLowerInvariant();
+                if (ext == ".package" || ext == ".sims3pack")
                 {
-                    string ext = Path.GetExtension(entry.Key).ToLowerInvariant();
-                    if (ext == ".package" || ext == ".sims3pack")
-                    {
-                        string? fn = Path.GetFileName(entry.Key);
-                        if (!string.IsNullOrEmpty(fn)) names.Add(fn);
-                    }
+                    string? fn = Path.GetFileName(entry.Key);
+                    if (!string.IsNullOrEmpty(fn)) names.Add(fn);
                 }
             }
         }
-        catch { }
         return names;
+    }
+
+    public static (string? ResolvedPath, bool ShouldSkip) ResolveDestinationPath(
+        string destinationFolder,
+        string fileName,
+        string duplicateAction,
+        Action<string>? onMarkDirty = null)
+    {
+        string destPath = Path.Combine(destinationFolder, fileName);
+        if (!File.Exists(destPath))
+        {
+            return (destPath, false);
+        }
+
+        if (string.Equals(duplicateAction, "skip", StringComparison.OrdinalIgnoreCase))
+        {
+            return (null, true);
+        }
+
+        if (string.Equals(duplicateAction, "replace", StringComparison.OrdinalIgnoreCase))
+        {
+            try { File.Delete(destPath); } catch { }
+            onMarkDirty?.Invoke(fileName);
+            return (destPath, false);
+        }
+
+        string uniqueName = $"{Guid.NewGuid().ToString("N")[..8]}_{fileName}";
+        return (Path.Combine(destinationFolder, uniqueName), false);
     }
 
     public List<string> GetDuplicateFiles(IEnumerable<string> fileNames)
@@ -78,13 +100,22 @@ public class ArchiveService
         var duplicates = new List<string>();
         if (!Directory.Exists(_options.ManagedPackageFolderPath)) return duplicates;
 
-        var existingInDb = _db.MetaEntities.Select(m => m.FileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var nameList = fileNames
+            .Select(Path.GetFileName)
+            .Where(n => !string.IsNullOrEmpty(n))
+            .Select(n => n!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
-        foreach (var name in fileNames)
+        if (nameList.Count == 0) return duplicates;
+
+        var existingInDb = _db.MetaEntities
+            .Where(m => nameList.Contains(m.FileName))
+            .Select(m => m.FileName)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var fileName in nameList)
         {
-            string fileName = Path.GetFileName(name);
-            if (string.IsNullOrEmpty(fileName)) continue;
-
             string dest = Path.Combine(_options.ManagedPackageFolderPath, fileName);
             if (File.Exists(dest) || existingInDb.Contains(fileName))
             {
@@ -111,23 +142,11 @@ public class ArchiveService
                 string? fileName = Path.GetFileName(entry.Key);
                 if (string.IsNullOrEmpty(fileName)) continue;
 
-                string destPath = Path.Combine(destinationFolder, fileName);
-                if (File.Exists(destPath))
+                var (destPath, shouldSkip) = ResolveDestinationPath(destinationFolder, fileName, duplicateAction, onMarkDirty);
+                if (shouldSkip || destPath == null)
                 {
-                    if (string.Equals(duplicateAction, "skip", StringComparison.OrdinalIgnoreCase))
-                    {
-                        onProgress?.Invoke($"Skipped duplicate file in archive: {fileName}");
-                        continue;
-                    }
-                    else if (string.Equals(duplicateAction, "replace", StringComparison.OrdinalIgnoreCase))
-                    {
-                        try { File.Delete(destPath); } catch { }
-                        onMarkDirty?.Invoke(fileName);
-                    }
-                    else
-                    {
-                        destPath = Path.Combine(destinationFolder, Guid.NewGuid().ToString().Substring(0, 8) + "_" + fileName);
-                    }
+                    onProgress?.Invoke($"Skipped duplicate file in archive: {fileName}");
+                    continue;
                 }
 
                 entry.WriteToFile(destPath, new ExtractionOptions { ExtractFullPath = false, Overwrite = true });

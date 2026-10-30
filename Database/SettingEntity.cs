@@ -1,4 +1,4 @@
-namespace PlumbobForge.Backend.Database;
+﻿namespace PlumbobForge.Backend.Database;
 
 public class SettingEntity
 {

@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml;
@@ -11,6 +12,7 @@ using Microsoft.Extensions.Options;
 using PlumbobForge.Backend.Configuration;
 using PlumbobForge.Backend.Database;
 using S3ForgeTools.GameFiles.Package;
+using S3ForgeTools.GameFiles.Textures;
 using S3ForgeTools.GameFiles.TS3Pack;
 using S3ForgeTools.Utils;
 
@@ -20,6 +22,12 @@ public class CacheBuilderService
 {
     private static readonly TGI_Key DollDressedKey = new(832458525u, 0u, 4064452635095512314uL);
     private static readonly byte[] ColonSpaceBytes = [(byte)':', (byte)' '];
+    private static readonly HashSet<char> InvalidFileNameChars = [.. Path.GetInvalidFileNameChars()];
+    private static readonly HashSet<char> InvalidCacheFolderChars = [.. Path.GetInvalidFileNameChars(), '/', '\\'];
+    private const long MaxBundleSize = 1024L * 1024L * 1024L; // 1 GB bundle limit
+
+    // Lots, Sims, worlds and patterns are exported to files; sets rebuilt in parallel must not write them at the same time.
+    private static readonly object NonPackageExportLock = new();
 
     private enum SpecialPackageType
     {
@@ -47,54 +55,24 @@ public class CacheBuilderService
     {
         if (string.IsNullOrEmpty(packageType)) return 4;
         // Group CAS items together first so StaticBundle_0 holds CAS items for fast CAS loading
-        if (packageType.Equals("CAS", StringComparison.OrdinalIgnoreCase) ||
-            packageType.Equals("Hair", StringComparison.OrdinalIgnoreCase) ||
-            packageType.Equals("Clothing", StringComparison.OrdinalIgnoreCase) ||
-            packageType.Equals("Accessories", StringComparison.OrdinalIgnoreCase) ||
-            packageType.Equals("Details", StringComparison.OrdinalIgnoreCase) ||
-            packageType.Equals("Skin", StringComparison.OrdinalIgnoreCase) ||
-            packageType.Equals("Skins", StringComparison.OrdinalIgnoreCase) ||
-            packageType.Equals("Sliders", StringComparison.OrdinalIgnoreCase) ||
-            packageType.Equals("Presets", StringComparison.OrdinalIgnoreCase))
+        if (PackageTypeHelper.IsCas(packageType))
         {
             return 1;
         }
 
         // Group Build/Buy objects together second
-        if (packageType.Equals("BuildBuy", StringComparison.OrdinalIgnoreCase) ||
-            packageType.Equals("Object", StringComparison.OrdinalIgnoreCase) ||
-            packageType.Equals("Objects", StringComparison.OrdinalIgnoreCase))
+        if (PackageTypeHelper.IsBuildBuy(packageType))
         {
             return 2;
         }
 
         // Patterns
-        if (packageType.Equals("Pattern", StringComparison.OrdinalIgnoreCase))
+        if (PackageTypeHelper.IsPattern(packageType))
         {
             return 3;
         }
 
         return 4;
-    }
-
-    private static bool ShouldCompressResource(ResourceEntry r, int compressionLevel)
-    {
-        if (r.IsCompressed || r.Length < 64) return false;
-
-        // Skip textures (_IMG: 0x00B2D882) and audio (AUDO: 0x01EEF63A) at low/balanced compression (level <= 2).
-        // They are already internally compressed (DXT1/3/5, MP3/XAS). Compressing them with RefPack
-        // wastes significant CPU during cache builds and causes in-game CAS/Buy Mode loading stutter.
-        // At level >= 3 (High/Max), compress everything as requested by user.
-        if (compressionLevel <= 2)
-        {
-            uint type = r.Key.Type;
-            if (type == 0x00B2D882u || type == 0x01EEF63Au)
-            {
-                return false;
-            }
-        }
-
-        return true;
     }
 
     private readonly AppDbContext _db;
@@ -126,9 +104,6 @@ public class CacheBuilderService
         {
             onProgress?.Invoke(_localizer.GetString("syncing_cache_to_sims3"));
 
-            string eaDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Electronic Arts");
-            if (eaDir == null) return;
-
             string sims3ModsDir = Path.Combine(GetSims3FolderPath(), "Mods");
             string sims3CacheDir = Path.Combine(sims3ModsDir, "Cache");
             string sims3ConfigDir = Path.Combine(sims3CacheDir, "Config");
@@ -140,16 +115,27 @@ public class CacheBuilderService
 
             EnsureMainResourceCfg(sims3ModsDir);
 
-            bool isStatic = string.Equals(_options.CacheMethod, "Static", StringComparison.OrdinalIgnoreCase);
-            if (isStatic)
+            var activeConfig = await _db.ConfigEntities
+                .Include(c => c.ConfigSetsEntities)
+                .ThenInclude(cs => cs.SetsEntity)
+                .FirstOrDefaultAsync(c => c.Active);
+
+            // Vault mode has no cache: Resource.cfg only points at the shard folders of the active configuration.
+            bool vaultMode = _options.EnableSingleSourceVault;
+            bool isStatic = !vaultMode && string.Equals(_options.CacheMethod, "Static", StringComparison.OrdinalIgnoreCase);
+            bool resourceCfgChanged = false;
+            if (vaultMode)
+            {
+                resourceCfgChanged = await WriteVaultResourceCfgAsync(sims3ConfigDir, activeConfig);
+            }
+            else if (isStatic)
             {
                 string configResourceCfgStatic = Path.Combine(sims3ConfigDir, "Resource.cfg");
-                using (StreamWriter sw = new StreamWriter(configResourceCfgStatic, false))
-                {
-                    sw.WriteLine("Priority 500");
-                    sw.WriteLine("PackedFile \"../StaticCache/*.package\"");
-                    sw.WriteLine("PackedFile \"../StaticCache/*/*.package\"");
-                }
+                var cfg = new StringBuilder();
+                cfg.AppendLine("Priority 500");
+                cfg.AppendLine("PackedFile \"../StaticCache/*.package\"");
+                cfg.AppendLine("PackedFile \"../StaticCache/*/*.package\"");
+                resourceCfgChanged = WriteResourceCfgIfChanged(configResourceCfgStatic, cfg.ToString());
 
                 // In Static mode: Clean up old dynamic set folders from Mods/Cache/ (keep only Config and StaticCache)
                 foreach (var dir in Directory.GetDirectories(sims3CacheDir))
@@ -176,10 +162,10 @@ public class CacheBuilderService
                     try { Directory.Delete(staticCacheDir, true); } catch { }
                 }
 
-                // Clean up old orphaned dynamic cache sets
-                var allSetsList = await _db.SetsEntities.ToListAsync();
-                var allSetsMap = allSetsList.ToDictionary(s => s.Id);
-                var allSetFolderNames = allSetsList.Select(s => GetSetFolderName(s, allSetsMap)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                // Clean up cache folders of deleted sets
+                var allSetFolderNames = (await _db.SetsEntities.Select(s => s.Id).ToListAsync())
+                    .Select(GetSetFolderName)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
                 allSetFolderNames.Add("Config");
 
                 foreach (var dir in Directory.GetDirectories(sims3CacheDir))
@@ -192,67 +178,39 @@ public class CacheBuilderService
                 }
             }
 
-            var activeConfig = await _db.ConfigEntities
-                .Include(c => c.ConfigSetsEntities)
-                .ThenInclude(cs => cs.SetsEntity)
-                .FirstOrDefaultAsync(c => c.Active);
-
             var targetFilesToSync = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-            if (!isStatic)
+            if (vaultMode)
             {
-                var allSetsList = await _db.SetsEntities.ToListAsync();
-                var allSetsMap = allSetsList.ToDictionary(s => s.Id);
-
-                string configResourceCfg = Path.Combine(sims3ConfigDir, "Resource.cfg");
-                using (StreamWriter sw = new StreamWriter(configResourceCfg, false))
+                // Lots and Sims stay library files in vault mode; deploy those of the active configuration directly.
+                foreach (var (dest, source) in await GetVaultModeLibraryDeploymentsAsync(activeConfig))
                 {
-                    sw.WriteLine("Priority 500");
-                    if (activeConfig != null)
+                    targetFilesToSync[dest] = source;
+                }
+            }
+            else if (!isStatic)
+            {
+                string configResourceCfg = Path.Combine(sims3ConfigDir, "Resource.cfg");
+                var cfg = new StringBuilder();
+                cfg.AppendLine("Priority 500");
+                if (activeConfig != null)
+                {
+                    foreach (var cs in activeConfig.ConfigSetsEntities.OrderBy(cs => cs.SetsEntityId))
                     {
-                        foreach (var cs in activeConfig.ConfigSetsEntities)
-                        {
-                            if (cs.SetsEntity != null)
-                            {
-                                string folderName = GetSetFolderName(cs.SetsEntity, allSetsMap);
-                                sw.WriteLine($"PackedFile \"../{folderName}/*.package\"");
-                                sw.WriteLine($"PackedFile \"../{folderName}/*/*.package\"");
+                        if (cs.SetsEntity == null) continue;
 
-                                string sourceSetCacheDir = GetSetPath(cs.SetsEntity, allSetsMap);
-                                if (Directory.Exists(sourceSetCacheDir))
-                                {
-                                    string nonPackageFile = Path.Combine(sourceSetCacheDir, "NonPackageItems.txt");
-                                    if (File.Exists(nonPackageFile))
-                                    {
-                                        foreach (var line in File.ReadAllLines(nonPackageFile))
-                                        {
-                                            if (string.IsNullOrWhiteSpace(line)) continue;
-                                            string fileName = Path.GetFileName(line);
-                                            string folder = Path.GetFileName(Path.GetDirectoryName(line)!);
-                                            string destPath = GetTS3FolderPath(folder, fileName);
-                                            targetFilesToSync[destPath] = line;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        string folderName = GetSetFolderName(cs.SetsEntity.Id);
+                        cfg.AppendLine($"PackedFile \"../{folderName}/*.package\"");
+                        cfg.AppendLine($"PackedFile \"../{folderName}/*/*.package\"");
+
+                        AddNonPackageTargets(Path.Combine(GetSetPath(cs.SetsEntity), "NonPackageItems.txt"), targetFilesToSync);
                     }
                 }
+                resourceCfgChanged = WriteResourceCfgIfChanged(configResourceCfg, cfg.ToString());
             }
             else
             {
-                string nonPackageFile = Path.Combine(staticCacheDir, "NonPackageItems.txt");
-                if (File.Exists(nonPackageFile))
-                {
-                    foreach (var line in File.ReadAllLines(nonPackageFile))
-                    {
-                        if (string.IsNullOrWhiteSpace(line)) continue;
-                        string fileName = Path.GetFileName(line);
-                        string folder = Path.GetFileName(Path.GetDirectoryName(line)!);
-                        string destPath = GetTS3FolderPath(folder, fileName);
-                        targetFilesToSync[destPath] = line;
-                    }
-                }
+                AddNonPackageTargets(Path.Combine(staticCacheDir, "NonPackageItems.txt"), targetFilesToSync);
             }
 
             // Sync SavedSims & Library (Lots) into Documents/Electronic Arts/The Sims 3/
@@ -262,7 +220,8 @@ public class CacheBuilderService
                 ? File.ReadAllLines(managedNonPkgFile).Where(l => !string.IsNullOrWhiteSpace(l)).ToHashSet(StringComparer.OrdinalIgnoreCase)
                 : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // Clean up ONLY items that were previously deployed by PlumbobForge and are no longer in the active configuration
+            // Clean up ONLY items that were previously deployed by PlumbobForge and are no longer in the active configuration.
+            // (This also removes the world copies older versions put into The Sims 3/Worlds, which the game never reads.)
             foreach (var oldFile in previouslyManagedNonPkg)
             {
                 if (!targetFilesToSync.ContainsKey(oldFile))
@@ -338,21 +297,16 @@ public class CacheBuilderService
 
                 foreach (var worldItem in allWorlds)
                 {
+                    // Library-mode rebuilds stage worlds as {item name}.world; otherwise use the item's own file.
                     string stagedWorldFile = Path.Combine(_options.DocumentBaseDir, "Worlds", Path.ChangeExtension(worldItem.FileName, ".world"));
-                    if (!File.Exists(stagedWorldFile))
+                    if (!File.Exists(stagedWorldFile) && File.Exists(worldItem.CompleteFileName) &&
+                        (worldItem.CompleteFileName.EndsWith(".world", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(worldItem.PackageType, PackageTypeHelper.World, StringComparison.OrdinalIgnoreCase)))
                     {
-                        string candidateName = Path.GetFileNameWithoutExtension(worldItem.FileName);
-                        string directCandidate = Path.Combine(_options.DocumentBaseDir, "Worlds", $"{candidateName}.world");
-                        if (File.Exists(directCandidate)) stagedWorldFile = directCandidate;
-                        else if (File.Exists(worldItem.CompleteFileName) && worldItem.CompleteFileName.EndsWith(".world", StringComparison.OrdinalIgnoreCase))
-                        {
-                            stagedWorldFile = worldItem.CompleteFileName;
-                        }
+                        stagedWorldFile = worldItem.CompleteFileName;
                     }
 
-                    string worldBaseName = File.Exists(stagedWorldFile)
-                        ? Path.GetFileNameWithoutExtension(stagedWorldFile)
-                        : Path.GetFileNameWithoutExtension(worldItem.FileName);
+                    string worldBaseName = Path.GetFileNameWithoutExtension(worldItem.FileName);
 
                     currentManaged.Add(worldBaseName);
 
@@ -391,7 +345,7 @@ public class CacheBuilderService
                     }
                 }
 
-                // Cleanup removed custom worlds
+                // Cleanup removed custom worlds (including ones older versions installed under a wrongly parsed name)
                 foreach (var delWorld in previouslyManaged)
                 {
                     if (!currentManaged.Contains(delWorld))
@@ -413,6 +367,16 @@ public class CacheBuilderService
                 }
                 catch { }
             }
+
+            // A different Resource.cfg (e.g. another configuration) loads different mods.
+            if (resourceCfgChanged)
+            {
+                OnGameContentChanged();
+            }
+            else
+            {
+                ProcessPendingGameCacheClear();
+            }
         }
         catch (Exception ex)
         {
@@ -420,8 +384,140 @@ public class CacheBuilderService
         }
     }
 
+    private void AddNonPackageTargets(string nonPackageFile, Dictionary<string, string> targets)
+    {
+        if (!File.Exists(nonPackageFile)) return;
+
+        foreach (var line in File.ReadAllLines(nonPackageFile))
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            if (line.EndsWith(".world", StringComparison.OrdinalIgnoreCase)) continue;
+
+            string fileName = Path.GetFileName(line);
+            string folder = Path.GetFileName(Path.GetDirectoryName(line)!);
+            targets[GetTS3FolderPath(folder, fileName)] = line;
+        }
+    }
+
+    private async Task<List<(string Dest, string Source)>> GetVaultModeLibraryDeploymentsAsync(ConfigEntity? activeConfig)
+    {
+        var result = new List<(string, string)>();
+        var activeSetIds = activeConfig?.ConfigSetsEntities.Select(cs => cs.SetsEntityId).ToList() ?? new List<long>();
+        if (activeSetIds.Count == 0) return result;
+
+        var items = await _db.MetaEntities
+            .AsNoTracking()
+            .Where(m => !m.IsVaultManaged && m.Enabled && m.SetsEntityId.HasValue && activeSetIds.Contains(m.SetsEntityId.Value))
+            .ToListAsync();
+
+        string sims3Dir = GetSims3FolderPath();
+        foreach (var item in items)
+        {
+            bool isSim = string.Equals(item.PackageType, PackageTypeHelper.Sim, StringComparison.OrdinalIgnoreCase) || item.FileType == "SIM";
+            bool isLot = !isSim && string.Equals(item.PackageType, PackageTypeHelper.Lot, StringComparison.OrdinalIgnoreCase);
+            if (!isSim && !isLot) continue;
+
+            string source = File.Exists(item.CompleteFileName)
+                ? item.CompleteFileName
+                : Path.Combine(_options.ManagedPackageFolderPath, item.FileName);
+            if (!File.Exists(source)) continue;
+
+            string dest = isSim
+                ? Path.Combine(sims3Dir, "SavedSims", Path.ChangeExtension(item.FileName, ".sim"))
+                : Path.Combine(sims3Dir, "Library", Path.ChangeExtension(item.FileName, ".package"));
+            result.Add((dest, source));
+        }
+        return result;
+    }
+
+    private static bool WriteResourceCfgIfChanged(string path, string content)
+    {
+        try
+        {
+            if (File.Exists(path) && string.Equals(File.ReadAllText(path), content, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+        catch { }
+
+        File.WriteAllText(path, content);
+        return true;
+    }
+
+    private async Task<bool> WriteVaultResourceCfgAsync(string sims3ConfigDir, ConfigEntity? activeConfig)
+    {
+        var activeSetIds = activeConfig?.ConfigSetsEntities.Select(cs => cs.SetsEntityId).ToList() ?? new List<long>();
+        var shards = await _db.VaultShards
+            .Include(s => s.SetsEntity)
+            .Where(s => activeSetIds.Contains(s.SetsEntityId))
+            .ToListAsync();
+
+        string vaultRoot = VaultService.GetVaultRootDirectory(GetSims3FolderPath());
+        var shardDirs = shards
+            .Select(s => Path.GetDirectoryName(VaultService.ResolveShardPath(vaultRoot, s, s.SetsEntity))!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(d => d, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        string configResourceCfg = Path.Combine(sims3ConfigDir, "Resource.cfg");
+        var cfg = new StringBuilder();
+        cfg.AppendLine("Priority 500");
+        foreach (var dir in shardDirs)
+        {
+            string rel = Path.GetRelativePath(vaultRoot, dir).Replace('\\', '/');
+            cfg.AppendLine($"PackedFile \"../../PF_Vault/{rel}/*.package\"");
+        }
+        return WriteResourceCfgIfChanged(configResourceCfg, cfg.ToString());
+    }
+
+    public async Task<bool> UpgradeSetCacheFoldersAsync()
+    {
+        if (_options.EnableSingleSourceVault || string.Equals(_options.CacheMethod, "Static", StringComparison.OrdinalIgnoreCase)) return false;
+
+        var allSets = await _db.SetsEntities.Include(s => s.MetaEntities).ToListAsync();
+        var allSetsMap = allSets.ToDictionary(s => s.Id);
+        var claimedLegacyFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        bool moved = false;
+        bool dirtied = false;
+
+        foreach (var set in allSets.OrderBy(s => s.Id))
+        {
+            string setPath = GetSetPath(set);
+            if (Directory.Exists(setPath)) continue;
+
+            // Two sets could share one old folder (names that sanitize the same); only the first may take it over.
+            string legacyPath = GetSetCachePath(GetLegacySetFolderName(set, allSetsMap));
+            if (Directory.Exists(legacyPath) && claimedLegacyFolders.Add(legacyPath))
+            {
+                try
+                {
+                    Directory.Move(legacyPath, setPath);
+                    moved = true;
+                    continue;
+                }
+                catch { }
+            }
+
+            if (!set.Dirty && (set.MetaEntities?.Any(m => m.Enabled) ?? false))
+            {
+                set.Dirty = true;
+                dirtied = true;
+            }
+        }
+
+        if (dirtied) await _db.SaveChangesAsync();
+        return moved;
+    }
+
     public async Task RebuildCacheAsync(bool forceRebuild = false, Action<string>? onProgress = null, List<(string FileName, string Reason)>? skippedFiles = null, ITaskProgressReporter? progress = null)
     {
+        // Rebuilding belongs to library mode only. Vault mods point at whole shards and must never be merged into a cache.
+        if (_options.EnableSingleSourceVault)
+        {
+            return;
+        }
+
         bool isStatic = string.Equals(_options.CacheMethod, "Static", StringComparison.OrdinalIgnoreCase);
         if (isStatic)
         {
@@ -431,23 +527,29 @@ public class CacheBuilderService
 
         try
         {
-            string eaDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Electronic Arts");
-            if (!string.IsNullOrEmpty(eaDir))
-            {
-                string staticDir = Path.Combine(GetSims3FolderPath(), "Mods", "Cache", "StaticCache");
-                if (Directory.Exists(staticDir)) Directory.Delete(staticDir, true);
-            }
+            string staticDir = Path.Combine(GetSims3FolderPath(), "Mods", "Cache", "StaticCache");
+            if (Directory.Exists(staticDir)) Directory.Delete(staticDir, true);
         }
         catch { }
 
         var allSets = await _db.SetsEntities.Include(s => s.MetaEntities).ToListAsync();
-        var allSetsMap = allSets.ToDictionary(s => s.Id);
-        var setsToRebuild = allSets.Where(s => forceRebuild || s.Dirty).ToList();
+        // A set whose cache folder is gone (deleted by hand, or never built) is rebuilt even if it looks clean.
+        var setsToRebuild = allSets
+            .Where(s => forceRebuild || s.Dirty || ((s.MetaEntities?.Any(m => m.Enabled) ?? false) && !Directory.Exists(GetSetPath(s))))
+            .ToList();
         int total = setsToRebuild.Count;
         int current = 0;
 
+        // ModBUILD packages are deleted and replaced; the running game has them open.
+        if (setsToRebuild.Count > 0)
+        {
+            Sims3GameProcess.ThrowIfGameRunning(_localizer.GetString("progress.game_running_rebuild"));
+            await LoadDisabledObjectsAsync();
+        }
+
         if (setsToRebuild.Count > 1)
         {
+            var updatedHashes = new ConcurrentDictionary<long, string>();
             var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1) };
             Parallel.ForEach(setsToRebuild, parallelOptions, set =>
             {
@@ -464,9 +566,8 @@ public class CacheBuilderService
 
                 try
                 {
-                    RebuildSet(set, onProgress, skippedFiles, shouldReport ? progress : null, shouldReport ? stepId : null, itemCount, allSetsMap, isParallelSet: true);
-                    set.CachedHash = SetDirtyTracker.ComputeContentHash(set);
-                    set.Dirty = false;
+                    RebuildSet(set, onProgress, skippedFiles, shouldReport ? progress : null, shouldReport ? stepId : null, itemCount, isParallelSet: true);
+                    updatedHashes[set.Id] = SetDirtyTracker.ComputeContentHash(set);
                     if (shouldReport)
                     {
                         progress?.CompleteStep(stepId, finalBadge: $"{itemCount}/{itemCount}");
@@ -481,6 +582,15 @@ public class CacheBuilderService
                     onProgress?.Invoke($"Error rebuilding set \"{set.Name}\": {ex.Message}");
                 }
             });
+
+            foreach (var set in setsToRebuild)
+            {
+                if (updatedHashes.TryGetValue(set.Id, out var hash))
+                {
+                    set.CachedHash = hash;
+                    set.Dirty = false;
+                }
+            }
         }
         else
         {
@@ -499,7 +609,7 @@ public class CacheBuilderService
 
                 try
                 {
-                    RebuildSet(set, onProgress, skippedFiles, shouldReport ? progress : null, shouldReport ? stepId : null, itemCount, allSetsMap, isParallelSet: false);
+                    RebuildSet(set, onProgress, skippedFiles, shouldReport ? progress : null, shouldReport ? stepId : null, itemCount, isParallelSet: false);
                     set.CachedHash = SetDirtyTracker.ComputeContentHash(set);
                     set.Dirty = false;
                     if (shouldReport)
@@ -519,34 +629,98 @@ public class CacheBuilderService
         }
 
         await _db.SaveChangesAsync();
+
+        if (total > 0)
+        {
+            PruneStagedNonPackageFiles(allSets.Select(s => Path.Combine(GetSetPath(s), "NonPackageItems.txt")));
+            OnGameContentChanged();
+            PruneTextureCache();
+        }
+    }
+
+    private TextureOptimizationCache? CreateTextureCache()
+    {
+        if (!_options.OptimizeTextures || string.IsNullOrWhiteSpace(_options.DocumentBaseDir)) return null;
+        try
+        {
+            return new TextureOptimizationCache(_options.DocumentBaseDir, _options.TextureMaxDimension);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void PruneTextureCache()
+    {
+        if (!_options.OptimizeTextures || string.IsNullOrWhiteSpace(_options.DocumentBaseDir)) return;
+        TextureOptimizationCache.Prune(_options.DocumentBaseDir, TextureOptimizer.GetProfile(_options.TextureMaxDimension));
+    }
+
+    private void PruneStagedNonPackageFiles(IEnumerable<string> nonPackageListFiles)
+    {
+        try
+        {
+            var listed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var listFile in nonPackageListFiles)
+            {
+                if (!File.Exists(listFile)) continue;
+                foreach (var line in File.ReadAllLines(listFile))
+                {
+                    if (!string.IsNullOrWhiteSpace(line)) listed.Add(Path.GetFullPath(line));
+                }
+            }
+
+            foreach (var sub in new[] { "Worlds", "Lots", "Sims" })
+            {
+                string dir = Path.Combine(_options.DocumentBaseDir, sub);
+                if (!Directory.Exists(dir)) continue;
+                foreach (var file in Directory.GetFiles(dir))
+                {
+                    if (listed.Contains(Path.GetFullPath(file))) continue;
+                    try { File.Delete(file); } catch { }
+                }
+            }
+        }
+        catch { }
+    }
+
+    public void OnGameContentChanged()
+    {
+        if (!_options.AutoClearGameCaches) return;
+        try
+        {
+            Sims3GameProcess.ClearCoreCachesOrDefer(GetSims3FolderPath(), _options.DocumentBaseDir);
+        }
+        catch { }
+    }
+
+    public void ProcessPendingGameCacheClear()
+    {
+        try
+        {
+            Sims3GameProcess.ProcessPendingCacheClear(GetSims3FolderPath(), _options.DocumentBaseDir);
+        }
+        catch { }
     }
 
     public async Task RebuildStaticCacheAsync(Action<string>? onProgress = null, List<(string FileName, string Reason)>? skippedFiles = null, ITaskProgressReporter? progress = null)
     {
+        if (_options.EnableSingleSourceVault)
+        {
+            return;
+        }
+
+        // Static bundles are deleted and replaced; the running game has them open.
+        Sims3GameProcess.ThrowIfGameRunning(_localizer.GetString("progress.game_running_rebuild"));
+
         onProgress?.Invoke(_localizer.GetString("rebuilding_static_cache"));
         string staticStepId = "rebuild_static_cache";
         progress?.StartStep(staticStepId, _localizer.GetString("progress.rebuilding_static_cache_title"), badge: _localizer.GetString("progress.badge_initializing"), progress: 0.0);
 
-        string eaDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Electronic Arts");
-        if (string.IsNullOrEmpty(eaDir))
-        {
-            progress?.WarningStep(staticStepId, "Cannot locate Electronic Arts folder", "Skipped");
-            return;
-        }
-
         string sims3CacheDir = Path.Combine(GetSims3FolderPath(), "Mods", "Cache");
         string staticCacheDir = Path.Combine(sims3CacheDir, "StaticCache");
         Directory.CreateDirectory(staticCacheDir);
-
-        // Clean out any existing files in StaticCache before rebuilding
-        try
-        {
-            foreach (var file in Directory.GetFiles(staticCacheDir))
-            {
-                try { File.Delete(file); } catch { }
-            }
-        }
-        catch { }
 
         var activeConfig = await _db.ConfigEntities
             .Include(c => c.ConfigSetsEntities)
@@ -567,301 +741,44 @@ public class CacheBuilderService
                 .ToListAsync();
         }
 
-        // Sort items by PackageType category so that CAS items, BuildBuy items, etc., are clustered into contiguous bundles
+        // Sort items by PackageType category so that CAS items, BuildBuy items, etc., are clustered into contiguous bundles.
+        // One entry per item: different mods may share a file name (in different library sub-folders).
         var allMetaItems = activeSets
             .SelectMany(s => s.MetaEntities ?? new List<MetaEntity>())
             .Where(m => m.Enabled)
-            .GroupBy(m => m.FileName, StringComparer.OrdinalIgnoreCase)
+            .GroupBy(m => m.Id)
             .Select(g => g.First())
             .OrderBy(m => GetPackageTypePriority(m.PackageType))
             .ThenBy(m => m.PackageType)
             .ThenBy(m => m.FileName)
+            .ThenBy(m => m.Id)
             .ToList();
 
         int totalItems = allMetaItems.Count;
-        int currentItem = 0;
-
-        DBPFPackageBuilder? outputPkg = null;
-        int packageCount = 0;
-        var addedTgis = new HashSet<TGI_Key>();
-        var nonPackageItems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
         int reportInterval = Math.Max(1, totalItems / 50);
-        object outputLock = new();
-        object nonPkgLock = new();
 
-        var parallelOptions = new ParallelOptions
+        // The old bundles stay in place until the new ones are complete.
+        await LoadDisabledObjectsAsync();
+        var ctx = new MergeContext(staticCacheDir, "StaticBundle_", CreateTextureCache(), skippedFiles, onProgress) { DisabledObjects = _disabledObjects };
+        DeleteStaleNewFiles(ctx);
+        MergeItems(allMetaItems, ctx, parallel: true, current =>
         {
-            MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1)
-        };
-
-        Parallel.ForEach(Partitioner.Create(allMetaItems, EnumerablePartitionerOptions.NoBuffering), parallelOptions, item =>
-        {
-            int current = Interlocked.Increment(ref currentItem);
             if (current % reportInterval == 0 || current == totalItems)
             {
                 double pct = totalItems > 0 ? (double)current / totalItems : 1.0;
-                string badge = $"{current}/{totalItems}";
-                progress?.UpdateStep(staticStepId, progress: pct, badge: badge);
+                progress?.UpdateStep(staticStepId, progress: pct, badge: $"{current}/{totalItems}");
                 onProgress?.Invoke(_localizer.GetString("merging_item", current, totalItems, "StaticCache"));
-            }
-
-            string filePath = item.CompleteFileName;
-            if (!File.Exists(filePath))
-            {
-                var fallback = Path.Combine(_options.ManagedPackageFolderPath, item.FileName);
-                if (File.Exists(fallback))
-                {
-                    filePath = fallback;
-                }
-                else
-                {
-                    SafeAddSkippedFile(skippedFiles, item.FileName, "File not found on disk");
-                    return;
-                }
-            }
-
-            if (!item.FileName.ToLower().EndsWith(".sims3pack"))
-            {
-                DBPFPackage? dbpfPackage = null;
-                try { dbpfPackage = new DBPFPackage(filePath); }
-                catch (Exception ex)
-                {
-                    SafeAddSkippedFile(skippedFiles, item.FileName, ex.Message);
-                    return;
-                }
-
-                if (dbpfPackage != null)
-                {
-                    try
-                    {
-                        string originalName = Path.GetFileNameWithoutExtension(item.FileName);
-                        var specialType = DetectSpecialPackageType(dbpfPackage);
-                        switch (specialType)
-                        {
-                            case SpecialPackageType.World:
-                            {
-                                lock (nonPkgLock)
-                                {
-                                    string? path = InstallAsWorld(dbpfPackage, originalName, nonPackageItems);
-                                    if (path != null) nonPackageItems.Add(path);
-                                }
-                                break;
-                            }
-                            case SpecialPackageType.Lot:
-                            {
-                                lock (nonPkgLock)
-                                {
-                                    string? path = InstallAsLot(dbpfPackage, originalName, nonPackageItems);
-                                    if (path != null) nonPackageItems.Add(path);
-                                }
-                                break;
-                            }
-                            case SpecialPackageType.Sim:
-                            {
-                                lock (nonPkgLock)
-                                {
-                                    string? path = InstallAsSim(dbpfPackage, originalName, nonPackageItems);
-                                    if (path != null) nonPackageItems.Add(path);
-                                }
-                                break;
-                            }
-                            case SpecialPackageType.Pattern:
-                            {
-                                lock (nonPkgLock)
-                                {
-                                    InstallAsPattern(dbpfPackage, originalName, staticCacheDir);
-                                }
-                                break;
-                            }
-                            default:
-                            {
-                                if (ValidatePackage(dbpfPackage))
-                                {
-                                    PreparePackageResources(dbpfPackage);
-                                    lock (outputLock)
-                                    {
-                                        RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, dbpfPackage, addedTgis, prePrepared: true);
-                                    }
-                                }
-                                else
-                                {
-                                    SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        SafeAddSkippedFile(skippedFiles, item.FileName, ex.Message);
-                    }
-                    finally
-                    {
-                        try { dbpfPackage.Close(); } catch { }
-                    }
-                }
-            }
-            else
-            {
-                try
-                {
-                    using (Sims3Pack sims3Pack = new Sims3Pack(filePath))
-                    {
-                        string originalName = Path.GetFileNameWithoutExtension(item.FileName);
-                        var worldPkg = sims3Pack.Packages.FirstOrDefault(p => DetectSpecialPackageType(p) == SpecialPackageType.World);
-                        if (worldPkg != null)
-                        {
-                            lock (nonPkgLock)
-                            {
-                                string? path = InstallAsWorld(worldPkg, originalName, nonPackageItems);
-                                if (path != null) nonPackageItems.Add(path);
-                            }
-
-                            foreach (DBPFPackage package in sims3Pack.Packages)
-                            {
-                                if (package == worldPkg) continue;
-
-                                var pkgType = DetectSpecialPackageType(package);
-                                switch (pkgType)
-                                {
-                                    case SpecialPackageType.Lot:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            string? lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                            if (lotPath != null) nonPackageItems.Add(lotPath);
-                                        }
-                                        break;
-                                    }
-                                    case SpecialPackageType.Sim:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            string? simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                            if (simPath != null) nonPackageItems.Add(simPath);
-                                        }
-                                        break;
-                                    }
-                                    case SpecialPackageType.Pattern:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            InstallAsPattern(package, originalName, staticCacheDir);
-                                        }
-                                        break;
-                                    }
-                                    default:
-                                    {
-                                        if (ValidatePackage(package))
-                                        {
-                                            PreparePackageResources(package);
-                                            lock (outputLock)
-                                            {
-                                                RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, package, addedTgis, prePrepared: true);
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        else
-                        {
-                            foreach (DBPFPackage package in sims3Pack.Packages)
-                            {
-                                var pkgType = DetectSpecialPackageType(package);
-                                switch (pkgType)
-                                {
-                                    case SpecialPackageType.Lot:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            string? lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                            if (lotPath != null) nonPackageItems.Add(lotPath);
-                                        }
-                                        break;
-                                    }
-                                    case SpecialPackageType.Sim:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            string? simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                            if (simPath != null) nonPackageItems.Add(simPath);
-                                        }
-                                        break;
-                                    }
-                                    case SpecialPackageType.Pattern:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            InstallAsPattern(package, originalName, staticCacheDir);
-                                        }
-                                        break;
-                                    }
-                                    default:
-                                    {
-                                        if (ValidatePackage(package))
-                                        {
-                                            PreparePackageResources(package);
-                                            lock (outputLock)
-                                            {
-                                                RebuildPackageStatic(ref outputPkg, ref packageCount, staticCacheDir, package, addedTgis, prePrepared: true);
-                                            }
-                                        }
-                                        else
-                                        {
-                                            SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    SafeAddSkippedFile(skippedFiles, item.FileName, ex.Message);
-                }
             }
         });
 
-        if (outputPkg != null)
+        foreach (var (entity, fallback) in ctx.FallbackUpdates)
         {
-            try { outputPkg.Close(); } catch { }
-            outputPkg = null;
+            entity.CompleteFileName = fallback;
         }
 
         try
         {
-            string[] oldFiles = Directory.GetFiles(staticCacheDir, "StaticBundle*.package");
-            foreach (string path in oldFiles)
-            {
-                try { File.Delete(path); } catch { }
-            }
-
-            string[] newFiles = Directory.GetFiles(staticCacheDir, "StaticBundle*.new");
-            foreach (string path in newFiles)
-            {
-                try
-                {
-                    string dest = Path.ChangeExtension(path, ".package");
-                    if (File.Exists(dest)) File.Delete(dest);
-                    File.Move(path, dest);
-                }
-                catch { }
-            }
-
-            string nonPackageFile = Path.Combine(staticCacheDir, "NonPackageItems.txt");
-            if (nonPackageItems.Count > 0)
-            {
-                try { File.WriteAllLines(nonPackageFile, nonPackageItems); } catch { }
-            }
-            else if (File.Exists(nonPackageFile))
-            {
-                try { File.Delete(nonPackageFile); } catch { }
-            }
+            FinalizeOutput(ctx);
 
             // In Static mode: Clean up old dynamic set folders from Mods/Cache/
             if (Directory.Exists(sims3CacheDir))
@@ -888,26 +805,54 @@ public class CacheBuilderService
         }
         await _db.SaveChangesAsync();
 
+        PruneStagedNonPackageFiles(new[] { Path.Combine(staticCacheDir, "NonPackageItems.txt") });
+        OnGameContentChanged();
+        PruneTextureCache();
+
         progress?.CompleteStep(staticStepId, finalBadge: _localizer.GetString("progress.items_merged_total_badge", totalItems));
     }
 
     public static string SanitizeForCache(string name)
     {
-        if (string.IsNullOrWhiteSpace(name)) return "";
-        string sanitized = name.Trim().Replace(' ', '-');
-        var invalidChars = Path.GetInvalidFileNameChars();
-        sanitized = new string(sanitized.Where(c => !invalidChars.Contains(c) && c != '/' && c != '\\').ToArray());
-        while (sanitized.Contains("--"))
+        if (string.IsNullOrWhiteSpace(name)) return string.Empty;
+        var trimmed = name.AsSpan().Trim();
+        var sb = new StringBuilder(trimmed.Length);
+        bool lastWasDash = false;
+
+        foreach (char c in trimmed)
         {
-            sanitized = sanitized.Replace("--", "-");
+            char current = c == ' ' ? '-' : c;
+            if (InvalidCacheFolderChars.Contains(current)) continue;
+
+            if (current == '-')
+            {
+                if (!lastWasDash && sb.Length > 0)
+                {
+                    sb.Append('-');
+                    lastWasDash = true;
+                }
+            }
+            else
+            {
+                sb.Append(current);
+                lastWasDash = false;
+            }
         }
-        return sanitized.Trim('-');
+
+        while (sb.Length > 0 && sb[^1] == '-')
+        {
+            sb.Length--;
+        }
+
+        return sb.ToString();
     }
 
-    public string GetSetFolderName(SetsEntity activeSet, Dictionary<long, SetsEntity>? allSetsMap = null)
-    {
-        if (activeSet == null) return "Default";
+    public static string GetSetFolderName(long setId) => $"Set_{setId}";
 
+    public string GetSetFolderName(SetsEntity activeSet, Dictionary<long, SetsEntity>? allSetsMap = null) => GetSetFolderName(activeSet.Id);
+
+    private string GetLegacySetFolderName(SetsEntity activeSet, Dictionary<long, SetsEntity> allSetsMap)
+    {
         if (activeSet.IsDefault || string.Equals(activeSet.Name, "Default", StringComparison.OrdinalIgnoreCase))
         {
             return "Default";
@@ -918,7 +863,7 @@ public class CacheBuilderService
         }
 
         var chain = new List<string>();
-        var current = activeSet;
+        SetsEntity? current = activeSet;
         var visited = new HashSet<long>();
 
         while (current != null && visited.Add(current.Id))
@@ -927,28 +872,9 @@ public class CacheBuilderService
             if (string.IsNullOrWhiteSpace(clean)) clean = $"Set_{current.Id}";
             chain.Insert(0, clean);
 
-            if (current.ParentSetsEntityId.HasValue)
-            {
-                if (allSetsMap != null && allSetsMap.TryGetValue(current.ParentSetsEntityId.Value, out var parent))
-                {
-                    current = parent;
-                }
-                else
-                {
-                    try
-                    {
-                        current = _db.SetsEntities.Find(current.ParentSetsEntityId.Value);
-                    }
-                    catch
-                    {
-                        current = null;
-                    }
-                }
-            }
-            else
-            {
-                break;
-            }
+            current = current.ParentSetsEntityId.HasValue && allSetsMap.TryGetValue(current.ParentSetsEntityId.Value, out var parent)
+                ? parent
+                : null;
         }
 
         string folderName = string.Join("-", chain);
@@ -958,26 +884,12 @@ public class CacheBuilderService
     public string GetSetPath(SetsEntity activeSet, Dictionary<long, SetsEntity>? allSetsMap = null)
     {
         if (activeSet == null) throw new ArgumentException("ActiveSet cannot be null");
-
-        string folderName = GetSetFolderName(activeSet, allSetsMap);
-
-        string eaDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Electronic Arts");
-        if (eaDir != null)
-        {
-            return Path.Combine(GetSims3FolderPath(), "Mods", "Cache", folderName);
-        }
-
-        return Path.Combine(_options.SetCacheFolderPath, "Sets", folderName);
+        return GetSetCachePath(GetSetFolderName(activeSet.Id));
     }
 
     public string GetSetCachePath(string folderName)
     {
-        string eaDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Electronic Arts");
-        if (!string.IsNullOrEmpty(eaDir))
-        {
-            return Path.Combine(GetSims3FolderPath(), "Mods", "Cache", folderName);
-        }
-        return Path.Combine(_options.SetCacheFolderPath, "Sets", folderName);
+        return Path.Combine(GetSims3FolderPath(), "Mods", "Cache", folderName);
     }
 
     public void RebuildSet(
@@ -987,334 +899,292 @@ public class CacheBuilderService
         ITaskProgressReporter? progress = null,
         string? stepId = null,
         int totalCount = 0,
-        Dictionary<long, SetsEntity>? allSetsMap = null,
         bool isParallelSet = false)
     {
-        if (activeSet.IsLegacy) return;
-
-        string setPath = GetSetPath(activeSet, allSetsMap);
+        string setPath = GetSetPath(activeSet);
         Directory.CreateDirectory(setPath);
 
-        DBPFPackageBuilder? outputPkg = null;
-        int packageCount = 0;
-        var addedTgis = new HashSet<TGI_Key>();
-        var nonPackageItems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        var metaEntities = activeSet.MetaEntities?.Where(m => m.Enabled).ToList() ?? new List<MetaEntity>();
+        var metaEntities = (activeSet.MetaEntities?.Where(m => m.Enabled) ?? Enumerable.Empty<MetaEntity>())
+            .OrderBy(m => GetPackageTypePriority(m.PackageType))
+            .ThenBy(m => m.PackageType)
+            .ThenBy(m => m.FileName)
+            .ThenBy(m => m.Id)
+            .ToList();
         int totalItems = metaEntities.Count;
-        int currentItem = 0;
         int reportInterval = Math.Max(1, totalItems / 50);
 
-        object outputLock = new();
-        object nonPkgLock = new();
+        var ctx = new MergeContext(setPath, "ModBUILD", CreateTextureCache(), skippedFiles, onProgress) { DisabledObjects = _disabledObjects };
+        DeleteStaleNewFiles(ctx);
 
         // If multiple sets are already running concurrently, process items inside this set sequentially
         // to prevent thread oversubscription. If only this single set is running and it has many items,
-        // process items using all CPU cores in parallel.
+        // read and prepare items on all CPU cores.
         bool runItemsInParallel = !isParallelSet && totalItems > 10;
-
-        void ProcessItem(MetaEntity item)
+        MergeItems(metaEntities, ctx, runItemsInParallel, current =>
         {
-            int current = Interlocked.Increment(ref currentItem);
-            bool isLast = current == totalItems;
-            if (current % reportInterval == 0 || isLast)
+            if (current % reportInterval == 0 || current == totalItems)
             {
                 double pct = totalItems > 0 ? (double)current / totalItems : 1.0;
-                string badge = $"{current}/{totalItems}";
                 if (stepId != null)
                 {
-                    progress?.UpdateStep(stepId, progress: pct, badge: badge);
+                    progress?.UpdateStep(stepId, progress: pct, badge: $"{current}/{totalItems}");
                 }
                 onProgress?.Invoke(_localizer.GetString("merging_item", current, totalItems, activeSet.Name));
             }
+        });
 
-            string filePath = item.CompleteFileName;
-            if (!File.Exists(filePath))
-            {
-                var fallback = Path.Combine(_options.ManagedPackageFolderPath, item.FileName);
-                if (File.Exists(fallback))
-                {
-                    filePath = fallback;
-                    item.CompleteFileName = fallback;
-                }
-                else
-                {
-                    SafeAddSkippedFile(skippedFiles, item.FileName, "File not found on disk");
-                    onProgress?.Invoke(_localizer.GetString("skipping_missing_file", item.FileName));
-                    return;
-                }
-            }
-
-            if (!item.FileName.ToLower().EndsWith(".sims3pack"))
-            {
-                DBPFPackage? dbpfPackage = null;
-                try
-                {
-                    dbpfPackage = new DBPFPackage(filePath);
-                }
-                catch (Exception ex)
-                {
-                    SafeAddSkippedFile(skippedFiles, item.FileName, ex.Message);
-                    onProgress?.Invoke(_localizer.GetString("skipping_unreadable_file", item.FileName, ex.Message));
-                    return;
-                }
-
-                if (dbpfPackage != null)
-                {
-                    try
-                    {
-                        string originalName = Path.GetFileNameWithoutExtension(item.FileName);
-                        var specialType = DetectSpecialPackageType(dbpfPackage);
-                        switch (specialType)
-                        {
-                            case SpecialPackageType.World:
-                            {
-                                lock (nonPkgLock)
-                                {
-                                    string? path = InstallAsWorld(dbpfPackage, originalName, nonPackageItems);
-                                    if (path != null) nonPackageItems.Add(path);
-                                }
-                                break;
-                            }
-                            case SpecialPackageType.Lot:
-                            {
-                                lock (nonPkgLock)
-                                {
-                                    string? path = InstallAsLot(dbpfPackage, originalName, nonPackageItems);
-                                    if (path != null) nonPackageItems.Add(path);
-                                }
-                                break;
-                            }
-                            case SpecialPackageType.Sim:
-                            {
-                                lock (nonPkgLock)
-                                {
-                                    string? path = InstallAsSim(dbpfPackage, originalName, nonPackageItems);
-                                    if (path != null) nonPackageItems.Add(path);
-                                }
-                                break;
-                            }
-                            case SpecialPackageType.Pattern:
-                            {
-                                lock (nonPkgLock)
-                                {
-                                    InstallAsPattern(dbpfPackage, originalName, setPath);
-                                }
-                                break;
-                            }
-                            default:
-                            {
-                                if (ValidatePackage(dbpfPackage))
-                                {
-                                    PreparePackageResources(dbpfPackage);
-                                    lock (outputLock)
-                                    {
-                                        RebuildPackage(ref outputPkg, ref packageCount, activeSet, dbpfPackage, addedTgis, allSetsMap, prePrepared: true);
-                                    }
-                                }
-                                else
-                                {
-                                    SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
-                                    onProgress?.Invoke(_localizer.GetString("skipping_invalid_package", item.FileName));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        SafeAddSkippedFile(skippedFiles, item.FileName, ex.Message);
-                        onProgress?.Invoke(_localizer.GetString("error_processing_package", item.FileName, ex.Message));
-                    }
-                    finally
-                    {
-                        try { dbpfPackage.Close(); } catch { }
-                    }
-                }
-            }
-            else
-            {
-                try
-                {
-                    using (Sims3Pack sims3Pack = new Sims3Pack(filePath))
-                    {
-                        string originalName = Path.GetFileNameWithoutExtension(item.FileName);
-                        var worldPkg = sims3Pack.Packages.FirstOrDefault(p => DetectSpecialPackageType(p) == SpecialPackageType.World);
-                        if (worldPkg != null)
-                        {
-                            lock (nonPkgLock)
-                            {
-                                string? path = InstallAsWorld(worldPkg, originalName, nonPackageItems);
-                                if (path != null) nonPackageItems.Add(path);
-                            }
-
-                            foreach (DBPFPackage package in sims3Pack.Packages)
-                            {
-                                if (package == worldPkg) continue;
-
-                                var pkgType = DetectSpecialPackageType(package);
-                                switch (pkgType)
-                                {
-                                    case SpecialPackageType.Lot:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            string? lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                            if (lotPath != null) nonPackageItems.Add(lotPath);
-                                        }
-                                        break;
-                                    }
-                                    case SpecialPackageType.Sim:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            string? simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                            if (simPath != null) nonPackageItems.Add(simPath);
-                                        }
-                                        break;
-                                    }
-                                    case SpecialPackageType.Pattern:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            InstallAsPattern(package, originalName, setPath);
-                                        }
-                                        break;
-                                    }
-                                    default:
-                                    {
-                                        if (ValidatePackage(package))
-                                        {
-                                            PreparePackageResources(package);
-                                            lock (outputLock)
-                                            {
-                                                RebuildPackage(ref outputPkg, ref packageCount, activeSet, package, addedTgis, allSetsMap, prePrepared: true);
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        else
-                        {
-                            foreach (DBPFPackage package in sims3Pack.Packages)
-                            {
-                                var pkgType = DetectSpecialPackageType(package);
-                                switch (pkgType)
-                                {
-                                    case SpecialPackageType.Lot:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            string? lotPath = InstallAsLot(package, originalName, nonPackageItems);
-                                            if (lotPath != null) nonPackageItems.Add(lotPath);
-                                        }
-                                        break;
-                                    }
-                                    case SpecialPackageType.Sim:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            string? simPath = InstallAsSim(package, originalName, nonPackageItems);
-                                            if (simPath != null) nonPackageItems.Add(simPath);
-                                        }
-                                        break;
-                                    }
-                                    case SpecialPackageType.Pattern:
-                                    {
-                                        lock (nonPkgLock)
-                                        {
-                                            InstallAsPattern(package, originalName, setPath);
-                                        }
-                                        break;
-                                    }
-                                    default:
-                                    {
-                                        if (ValidatePackage(package))
-                                        {
-                                            PreparePackageResources(package);
-                                            lock (outputLock)
-                                            {
-                                                RebuildPackage(ref outputPkg, ref packageCount, activeSet, package, addedTgis, allSetsMap, prePrepared: true);
-                                            }
-                                        }
-                                        else
-                                        {
-                                            SafeAddSkippedFile(skippedFiles, item.FileName, "Failed validation (possible corrupt data)");
-                                            onProgress?.Invoke(_localizer.GetString("skipping_invalid_package_sims3pack", item.FileName));
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    SafeAddSkippedFile(skippedFiles, item.FileName, ex.Message);
-                    onProgress?.Invoke(_localizer.GetString("skipping_unreadable_sims3pack", item.FileName, ex.Message));
-                }
-            }
+        foreach (var (entity, fallback) in ctx.FallbackUpdates)
+        {
+            entity.CompleteFileName = fallback;
         }
 
-        if (runItemsInParallel)
+        FinalizeOutput(ctx);
+
+        activeSet.CachedHash = SetDirtyTracker.ComputeContentHash(activeSet);
+        activeSet.Dirty = false;
+    }
+
+    private sealed class MergeContext
+    {
+        public MergeContext(string outputDir, string bundlePrefix, TextureOptimizationCache? textureCache,
+            List<(string FileName, string Reason)>? skippedFiles, Action<string>? onProgress)
         {
-            var parallelOptions = new ParallelOptions
-            {
-                MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1)
-            };
-            Parallel.ForEach(Partitioner.Create(metaEntities, EnumerablePartitionerOptions.NoBuffering), parallelOptions, ProcessItem);
-        }
-        else
-        {
-            foreach (var item in metaEntities)
-            {
-                ProcessItem(item);
-            }
+            OutputDir = outputDir;
+            BundlePrefix = bundlePrefix;
+            TextureCache = textureCache;
+            SkippedFiles = skippedFiles;
+            OnProgress = onProgress;
         }
 
-        if (outputPkg != null)
+        public string OutputDir { get; }
+        public string BundlePrefix { get; }
+        public TextureOptimizationCache? TextureCache { get; }
+        public List<(string FileName, string Reason)>? SkippedFiles { get; }
+        public Action<string>? OnProgress { get; }
+        public HashSet<string> NonPackageItems { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> PatternFiles { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public ConcurrentBag<(MetaEntity Entity, string FallbackPath)> FallbackUpdates { get; } = new();
+        public IReadOnlyDictionary<long, HashSet<TGI_Key>> DisabledObjects { get; init; } = new Dictionary<long, HashSet<TGI_Key>>();
+    }
+
+    // Loaded before set rebuilds start (they may run in parallel and must not share the DbContext).
+    private IReadOnlyDictionary<long, HashSet<TGI_Key>> _disabledObjects = new Dictionary<long, HashSet<TGI_Key>>();
+
+    private async Task LoadDisabledObjectsAsync()
+    {
+        var rows = await _db.DisabledObjects.AsNoTracking()
+            .Select(d => new { d.MetaEntityId, d.Type, d.Group, d.Instance })
+            .ToListAsync();
+        _disabledObjects = rows
+            .GroupBy(d => d.MetaEntityId)
+            .ToDictionary(g => g.Key, g => g.Select(d => new TGI_Key(d.Type, d.Group, d.Instance)).ToHashSet());
+    }
+
+    private sealed class PreparedItem : IDisposable
+    {
+        public List<DBPFPackage> ToMerge { get; } = new();
+        public List<Action> Closers { get; } = new();
+
+        public void Dispose()
         {
-            try { outputPkg.Close(); } catch { }
-            outputPkg = null;
+            foreach (var close in Closers)
+            {
+                try { close(); } catch { }
+            }
+        }
+    }
+
+    private void MergeItems(IReadOnlyList<MetaEntity> items, MergeContext ctx, bool parallel, Action<int> onItemDone)
+    {
+        DBPFPackageBuilder? outputPkg = null;
+        int packageCount = 0;
+        var addedTgis = new HashSet<TGI_Key>();
+        int done = 0;
+        var pending = new Queue<Task<PreparedItem?>>();
+
+        void Consume(PreparedItem? prepared)
+        {
+            if (prepared != null)
+            {
+                using (prepared)
+                {
+                    foreach (var package in prepared.ToMerge)
+                    {
+                        AppendPackageResources(ref outputPkg, ref packageCount, ctx.OutputDir, ctx.BundlePrefix, package, addedTgis);
+                    }
+                }
+            }
+            onItemDone(++done);
         }
 
         try
         {
-            string[] oldFiles = Directory.GetFiles(setPath, "ModBUILD*.package");
-            foreach (string path in oldFiles)
+            if (!parallel)
+            {
+                foreach (var item in items)
+                {
+                    Consume(PrepareItem(item, ctx));
+                }
+            }
+            else
+            {
+                // A bounded window of items is read ahead; results are merged strictly in order.
+                int window = Math.Max(2, Environment.ProcessorCount - 1);
+                foreach (var item in items)
+                {
+                    if (pending.Count >= window)
+                    {
+                        Consume(pending.Dequeue().GetAwaiter().GetResult());
+                    }
+                    var captured = item;
+                    pending.Enqueue(Task.Run(() => PrepareItem(captured, ctx)));
+                }
+                while (pending.Count > 0)
+                {
+                    Consume(pending.Dequeue().GetAwaiter().GetResult());
+                }
+            }
+        }
+        finally
+        {
+            // Only reached with items left after a failure: close what was already read.
+            while (pending.Count > 0)
+            {
+                try { pending.Dequeue().GetAwaiter().GetResult()?.Dispose(); } catch { }
+            }
+            if (outputPkg != null)
+            {
+                try { outputPkg.Close(); } catch { }
+            }
+        }
+    }
+
+    private PreparedItem? PrepareItem(MetaEntity item, MergeContext ctx)
+    {
+        string filePath = item.CompleteFileName;
+        if (!File.Exists(filePath))
+        {
+            var fallback = Path.Combine(_options.ManagedPackageFolderPath, item.FileName);
+            if (File.Exists(fallback))
+            {
+                filePath = fallback;
+                ctx.FallbackUpdates.Add((item, fallback));
+            }
+            else
+            {
+                SafeAddSkippedFile(ctx.SkippedFiles, item.FileName, "File not found on disk");
+                ctx.OnProgress?.Invoke(_localizer.GetString("skipping_missing_file", item.FileName));
+                return null;
+            }
+        }
+
+        bool isSims3Pack = item.FileName.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase);
+        // Exported lots, Sims, worlds and patterns are named after the item, which is unique in the library.
+        string originalName = Path.GetFileNameWithoutExtension(item.FileName);
+        var textureCache = item.SkipTextureOptimization ? null : ctx.TextureCache;
+        ctx.DisabledObjects.TryGetValue(item.Id, out var disabledObjects);
+        var prepared = new PreparedItem();
+
+        try
+        {
+            IEnumerable<DBPFPackage> packages;
+            if (isSims3Pack)
+            {
+                var sims3Pack = new Sims3Pack(filePath);
+                prepared.Closers.Add(sims3Pack.Dispose);
+                packages = sims3Pack.Packages;
+            }
+            else
+            {
+                var package = new DBPFPackage(filePath);
+                prepared.Closers.Add(() => package.Close());
+                packages = new[] { package };
+            }
+
+            foreach (var package in packages)
+            {
+                switch (DetectSpecialPackageType(package))
+                {
+                    case SpecialPackageType.World:
+                        lock (NonPackageExportLock) ctx.NonPackageItems.Add(ExportNonPackage(package, "Worlds", originalName, ".world", ctx.NonPackageItems));
+                        break;
+                    case SpecialPackageType.Lot:
+                        lock (NonPackageExportLock) ctx.NonPackageItems.Add(ExportNonPackage(package, "Lots", originalName, ".package", ctx.NonPackageItems));
+                        break;
+                    case SpecialPackageType.Sim:
+                        lock (NonPackageExportLock) ctx.NonPackageItems.Add(ExportNonPackage(package, "Sims", originalName, ".sim", ctx.NonPackageItems));
+                        break;
+                    case SpecialPackageType.Pattern:
+                        lock (NonPackageExportLock) ctx.PatternFiles.Add(InstallAsPattern(package, originalName, ctx.OutputDir, ctx.PatternFiles));
+                        break;
+                    default:
+                        if (ValidatePackage(package))
+                        {
+                            PreparePackageResources(package, textureCache, disabledObjects);
+                            prepared.ToMerge.Add(package);
+                        }
+                        else
+                        {
+                            SafeAddSkippedFile(ctx.SkippedFiles, item.FileName, "Failed validation (possible corrupt data)");
+                            ctx.OnProgress?.Invoke(_localizer.GetString(isSims3Pack ? "skipping_invalid_package_sims3pack" : "skipping_invalid_package", item.FileName));
+                        }
+                        break;
+                }
+            }
+            return prepared;
+        }
+        catch (Exception ex)
+        {
+            prepared.Dispose();
+            SafeAddSkippedFile(ctx.SkippedFiles, item.FileName, ex.Message);
+            ctx.OnProgress?.Invoke(_localizer.GetString(isSims3Pack ? "skipping_unreadable_sims3pack" : "skipping_unreadable_file", item.FileName, ex.Message));
+            return null;
+        }
+    }
+
+    private static void DeleteStaleNewFiles(MergeContext ctx)
+    {
+        try
+        {
+            foreach (var path in Directory.GetFiles(ctx.OutputDir, $"{ctx.BundlePrefix}*.new"))
+            {
+                try { File.Delete(path); } catch { }
+            }
+        }
+        catch { }
+    }
+
+    private static void FinalizeOutput(MergeContext ctx)
+    {
+        try
+        {
+            foreach (string path in Directory.GetFiles(ctx.OutputDir, $"{ctx.BundlePrefix}*.package"))
             {
                 try { File.Delete(path); } catch { }
             }
 
-            string[] newFiles = Directory.GetFiles(setPath, "ModBUILD*.new");
-            foreach (string path in newFiles)
+            foreach (string path in Directory.GetFiles(ctx.OutputDir, $"{ctx.BundlePrefix}*.new"))
             {
-                try
-                {
-                    string dest = Path.ChangeExtension(path, ".package");
-                    if (File.Exists(dest)) File.Delete(dest);
-                    File.Move(path, dest);
-                }
-                catch { }
+                try { File.Move(path, Path.ChangeExtension(path, ".package"), overwrite: true); } catch { }
+            }
+
+            foreach (string path in Directory.GetFiles(ctx.OutputDir, "Pattern_*.package"))
+            {
+                if (ctx.PatternFiles.Contains(path)) continue;
+                try { File.Delete(path); } catch { }
             }
         }
         catch { }
 
-        string nonPackageFile = Path.Combine(setPath, "NonPackageItems.txt");
-        if (nonPackageItems.Count > 0)
+        string nonPackageFile = Path.Combine(ctx.OutputDir, "NonPackageItems.txt");
+        if (ctx.NonPackageItems.Count > 0)
         {
-            try { File.WriteAllLines(nonPackageFile, nonPackageItems); } catch { }
+            try { File.WriteAllLines(nonPackageFile, ctx.NonPackageItems.OrderBy(p => p, StringComparer.OrdinalIgnoreCase)); } catch { }
         }
         else if (File.Exists(nonPackageFile))
         {
             try { File.Delete(nonPackageFile); } catch { }
         }
-
-        activeSet.CachedHash = SetDirtyTracker.ComputeContentHash(activeSet);
-        activeSet.Dirty = false;
     }
 
     private static void SafeAddSkippedFile(List<(string FileName, string Reason)>? skippedFiles, string fileName, string reason)
@@ -1328,49 +1198,50 @@ public class CacheBuilderService
         }
     }
 
-    private void PreparePackageResources(DBPFPackage package)
+    private void PreparePackageResources(DBPFPackage package, TextureOptimizationCache? textureCache = null, HashSet<TGI_Key>? disabledObjects = null)
     {
-        foreach (var resource in package.Resources)
+        var resources = package.Resources;
+        if (disabledObjects is { Count: > 0 })
         {
-            if (resource.Key.Type == 3571055589u) FixPTRN(resource);
-            else if (resource.Key.Type == 53690476) FixPTRN_XML(resource);
+            resources.RemoveAll(r => disabledObjects.Contains(r.Key));
         }
-
-        if (_options.CompressionLevel > 0)
+        for (int i = 0; i < resources.Count; i++)
         {
-            var uncompressedResources = package.Resources
-                .Where(r => ShouldCompressResource(r, _options.CompressionLevel))
-                .ToList();
-
-            if (uncompressedResources.Count == 1)
+            var resource = resources[i];
+            uint type = resource.Key.Type;
+            if (type == 3571055589u) FixPTRN(resource);
+            else if (type == 53690476) FixPTRN_XML(resource);
+            else if (textureCache != null && TextureOptimizer.IsTextureType(type))
             {
-                try { uncompressedResources[0].Compress(_options.CompressionLevel); } catch { }
-            }
-            else if (uncompressedResources.Count > 1)
-            {
-                var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1) };
-                Parallel.ForEach(uncompressedResources, parallelOptions, resource =>
-                {
-                    try { resource.Compress(_options.CompressionLevel); }
-                    catch (Exception) { /* If compression fails, keep original uncompressed resource */ }
-                });
+                resources[i] = TryUseOptimizedTexture(resource, textureCache) ?? resource;
             }
         }
     }
 
-    private void RebuildPackageStatic(
+    private static ResourceEntry? TryUseOptimizedTexture(ResourceEntry resource, TextureOptimizationCache textureCache)
+    {
+        try
+        {
+            byte[] raw = resource.ReadRaw();
+            var optimized = textureCache.GetOrCreate(raw, () => resource.IsCompressed ? resource.Read() : raw);
+            if (optimized == null) return null;
+            return new ResourceEntry(new MemoryStream(optimized.Chunk, writable: false), resource.Key, 0, optimized.Chunk.Length,
+                optimized.ResourceLength, optimized.IsCompressed, resource.IsEncrypted);
+        }
+        catch
+        {
+            return null; // Keep the original texture.
+        }
+    }
+
+    private void AppendPackageResources(
         ref DBPFPackageBuilder? outputPkg,
         ref int packageCount,
-        string staticCachePath,
+        string targetDirectory,
+        string bundlePrefix,
         DBPFPackage inputPkg,
-        HashSet<TGI_Key> addedTgis,
-        bool prePrepared = false)
+        HashSet<TGI_Key> addedTgis)
     {
-        if (!prePrepared)
-        {
-            PreparePackageResources(inputPkg);
-        }
-
         foreach (var resource in inputPkg.Resources)
         {
             if (!ValidateResource(resource.Key)) continue;
@@ -1380,13 +1251,13 @@ public class CacheBuilderService
             {
                 if (outputPkg == null)
                 {
-                    string path = Path.Combine(staticCachePath, $"StaticBundle_{packageCount++}.new");
-                    outputPkg = new DBPFPackageBuilder(path);
+                    string path = Path.Combine(targetDirectory, $"{bundlePrefix}{packageCount++}.new");
+                    outputPkg = new DBPFPackageBuilder(path, false, catalogFirstLayout: true);
                 }
 
                 outputPkg.AddResource(resource);
 
-                if (outputPkg.PackageSize >= 1073741824)
+                if (outputPkg.PackageSize >= MaxBundleSize)
                 {
                     outputPkg.Close();
                     outputPkg = null;
@@ -1405,56 +1276,16 @@ public class CacheBuilderService
         return Path.Combine(GetSims3FolderPath(), subFolder, fileName);
     }
 
-    private void RebuildPackage(
-        ref DBPFPackageBuilder? outputPkg,
-        ref int packageCount,
-        SetsEntity activeSet,
-        DBPFPackage package,
-        HashSet<TGI_Key> addedTgis,
-        Dictionary<long, SetsEntity>? allSetsMap = null,
-        bool prePrepared = false)
-    {
-        if (!prePrepared)
-        {
-            PreparePackageResources(package);
-        }
-
-        foreach (var resource in package.Resources)
-        {
-            if (!ValidateResource(resource.Key)) continue;
-            if (!addedTgis.Add(resource.Key)) continue;
-
-            try
-            {
-                if (outputPkg == null)
-                {
-                    string path = Path.Combine(GetSetPath(activeSet, allSetsMap), $"ModBUILD{packageCount++}.new");
-                    outputPkg = new DBPFPackageBuilder(path);
-                }
-
-                outputPkg.AddResource(resource);
-
-                if (outputPkg.PackageSize >= 1073741824)
-                {
-                    outputPkg.Close();
-                    outputPkg = null;
-                }
-            }
-            catch (Exception) { }
-        }
-    }
-
-    private void FixPTRN(ResourceEntry resource)
+    private void FixResKeyColonSpace(ResourceEntry resource, string tagName)
     {
         byte[] data = resource.Read();
         if (data.AsSpan().IndexOf(ColonSpaceBytes) < 0) return;
         string text = System.Text.Encoding.UTF8.GetString(data);
-        if (!text.Contains(": ")) return;
 
         XmlDocument xmlDocument = new XmlDocument();
-        try { xmlDocument.LoadXml(text); } catch { }
+        try { xmlDocument.LoadXml(text); } catch { return; }
         bool flag = false;
-        XmlNodeList elementsByTagName = xmlDocument.GetElementsByTagName("pattern");
+        XmlNodeList elementsByTagName = xmlDocument.GetElementsByTagName(tagName);
         foreach (XmlElement item in elementsByTagName)
         {
             string attribute = item.GetAttribute("reskey");
@@ -1472,33 +1303,9 @@ public class CacheBuilderService
         }
     }
 
-    private void FixPTRN_XML(ResourceEntry resource)
-    {
-        byte[] data = resource.Read();
-        if (data.AsSpan().IndexOf(ColonSpaceBytes) < 0) return;
-        string text = System.Text.Encoding.UTF8.GetString(data);
-        if (!text.Contains(": ")) return;
+    private void FixPTRN(ResourceEntry resource) => FixResKeyColonSpace(resource, "pattern");
 
-        XmlDocument xmlDocument = new XmlDocument();
-        try { xmlDocument.LoadXml(text); } catch { }
-        bool flag = false;
-        XmlNodeList elementsByTagName = xmlDocument.GetElementsByTagName("complate");
-        foreach (XmlElement item in elementsByTagName)
-        {
-            string attribute = item.GetAttribute("reskey");
-            if (!string.IsNullOrEmpty(attribute) && attribute.Contains(": "))
-            {
-                item.SetAttribute("reskey", attribute.Replace(": ", ":"));
-                flag = true;
-            }
-        }
-        if (flag)
-        {
-            MemoryStream memoryStream = new MemoryStream();
-            xmlDocument.Save(memoryStream);
-            resource.ChangeStream(memoryStream);
-        }
-    }
+    private void FixPTRN_XML(ResourceEntry resource) => FixResKeyColonSpace(resource, "complate");
 
     private void EnsureMainResourceCfg(string sims3ModsDir)
     {
@@ -1515,6 +1322,7 @@ public class CacheBuilderService
                 sw.WriteLine("PackedFile Packages/*/*/*.package");
                 sw.WriteLine("PackedFile Packages/*/*/*/*.package");
                 sw.WriteLine("PackedFile Packages/*/*/*/*/*.package");
+                sw.WriteLine("Priority 1000");
                 sw.WriteLine("PackedFile Overrides/*.package");
                 sw.WriteLine("PackedFile Overrides/*/*.package");
                 sw.WriteLine("PackedFile Overrides/*/*/*.package");
@@ -1568,18 +1376,19 @@ public class CacheBuilderService
         }
     }
 
-    private string? InstallAsWorld(DBPFPackage package, string defaultName, ISet<string> nonPackageItems)
+    private string ExportNonPackage(DBPFPackage package, string subDir, string baseName, string extension, ISet<string> claimed)
     {
-        string worldName = GetWorldName(package, defaultName);
-        string worldsDir = Path.Combine(_options.DocumentBaseDir, "Worlds");
-        Directory.CreateDirectory(worldsDir);
+        string dir = Path.Combine(_options.DocumentBaseDir, subDir);
+        Directory.CreateDirectory(dir);
 
-        string basePath = Path.Combine(worldsDir, $"{worldName}.world");
-        string path = basePath;
+        string name = SanitizeFileName(baseName);
+        if (string.IsNullOrWhiteSpace(name)) name = "Item";
+
+        string path = Path.Combine(dir, $"{name}{extension}");
         int count = 1;
-        while (nonPackageItems.Contains(path))
+        while (claimed.Contains(path))
         {
-            path = Path.Combine(worldsDir, $"{worldName}_{count}.world");
+            path = Path.Combine(dir, $"{name}_{count}{extension}");
             count++;
         }
 
@@ -1587,124 +1396,37 @@ public class CacheBuilderService
         return path;
     }
 
-    private string? InstallAsLot(DBPFPackage package, string defaultName, ISet<string> nonPackageItems)
+    private static string InstallAsPattern(DBPFPackage package, string defaultName, string outputDir, ISet<string> claimed)
     {
-        string lotName = GetLotName(package, defaultName);
-        string lotsDir = Path.Combine(_options.DocumentBaseDir, "Lots");
-        Directory.CreateDirectory(lotsDir);
-
-        string basePath = Path.Combine(lotsDir, $"{lotName}.package");
-        string path = basePath;
-        int count = 1;
-        while (nonPackageItems.Contains(path))
-        {
-            path = Path.Combine(lotsDir, $"{lotName}_{count}.package");
-            count++;
-        }
-
-        package.Export(path);
-        return path;
-    }
-
-    private string? InstallAsSim(DBPFPackage package, string defaultName, ISet<string> nonPackageItems)
-    {
-        string simName = GetSimName(package, defaultName);
-        string simsDir = Path.Combine(_options.DocumentBaseDir, "Sims");
-        Directory.CreateDirectory(simsDir);
-
-        string basePath = Path.Combine(simsDir, $"{simName}.sim");
-        string path = basePath;
-        int count = 1;
-        while (nonPackageItems.Contains(path))
-        {
-            path = Path.Combine(simsDir, $"{simName}_{count}.sim");
-            count++;
-        }
-
-        package.Export(path);
-        return path;
-    }
-
-    private void InstallAsPattern(DBPFPackage package, string defaultName, string outputDir)
-    {
-        string patternName = GetPatternName(package, defaultName);
+        string name = SanitizeFileName(defaultName);
+        if (string.IsNullOrWhiteSpace(name)) name = "Pattern";
         Directory.CreateDirectory(outputDir);
-        string path = Path.Combine(outputDir, $"Pattern_{patternName}.package");
+
+        string path = Path.Combine(outputDir, $"Pattern_{name}.package");
+        int count = 1;
+        while (claimed.Contains(path))
+        {
+            path = Path.Combine(outputDir, $"Pattern_{name}_{count}.package");
+            count++;
+        }
+
         package.Export(path);
+        return path;
     }
 
-    private string GetPatternName(DBPFPackage package, string defaultName)
+    private static string SanitizeFileName(string name)
     {
-        string name = defaultName;
-        ResourceEntry? resourceEntry = package.Resources.Find((ResourceEntry r) => r.Key.Type == 3571055589u);
-        if (resourceEntry != null)
+        if (string.IsNullOrEmpty(name)) return string.Empty;
+        char[]? buffer = null;
+        for (int i = 0; i < name.Length; i++)
         {
-            byte[] bytes = resourceEntry.Read();
-            string @string = System.Text.Encoding.UTF8.GetString(bytes);
-            XmlDocument xmlDocument = new XmlDocument();
-            try
+            if (InvalidFileNameChars.Contains(name[i]))
             {
-                xmlDocument.LoadXml(@string);
-                XmlNode? xmlNode = xmlDocument.SelectSingleNode("/pattern/name");
-                if (xmlNode != null && !string.IsNullOrEmpty(xmlNode.InnerText))
-                {
-                    name = xmlNode.InnerText;
-                }
-            }
-            catch (Exception)
-            {
+                buffer ??= name.ToCharArray();
+                buffer[i] = '_';
             }
         }
-        name = SanitizeFileName(name);
-        return name;
-    }
-
-    private string GetSimName(DBPFPackage package, string defaultName)
-    {
-        string name = defaultName;
-        ResourceEntry? resourceEntry = package.Resources.Find((ResourceEntry r) => r.Key.Type == 83396964);
-        if (resourceEntry != null)
-        {
-            byte[] bytes = resourceEntry.Read();
-            string @string = System.Text.Encoding.Unicode.GetString(bytes);
-            name = @string.Split(new char[1])[0];
-        }
-        name = SanitizeFileName(name);
-        return name;
-    }
-
-    private string GetWorldName(DBPFPackage package, string defaultName)
-    {
-        string text = defaultName;
-        ResourceEntry? resourceEntry = package.Resources.Find((ResourceEntry r) => r.Key.Type == 107542056);
-        if (resourceEntry != null)
-        {
-            byte[] bytes = resourceEntry.Read();
-            string @string = System.Text.Encoding.Unicode.GetString(bytes);
-            text = @string.Split(new char[1])[0];
-        }
-        text = SanitizeFileName(text);
-        return text;
-    }
-
-    private string GetLotName(DBPFPackage package, string defaultName)
-    {
-        string text = defaultName;
-        ResourceEntry? resourceEntry = package.Resources.Find((ResourceEntry r) => r.Key.Type == 3496170587u);
-        if (resourceEntry != null)
-        {
-            byte[] bytes = resourceEntry.Read();
-            string @string = System.Text.Encoding.Unicode.GetString(bytes);
-            text = @string.Split(new char[1])[0];
-        }
-        text = SanitizeFileName(text);
-        return text;
-    }
-
-    private string SanitizeFileName(string name)
-    {
-        var invalid = Path.GetInvalidFileNameChars();
-        return new string(name.Select(c => invalid.Contains(c) ? '_' : c).ToArray());
+        return buffer != null ? new string(buffer) : name;
     }
 
     private bool ValidateResource(TGI_Key key)

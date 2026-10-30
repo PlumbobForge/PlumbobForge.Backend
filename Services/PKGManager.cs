@@ -27,6 +27,10 @@ public class PKGManager
     private readonly ThumbnailService _thumbnailService;
     private readonly CacheBuilderService _cacheBuilderService;
     private readonly MigrationService _migrationService;
+    private readonly VaultService _vaultService;
+    private readonly Sims3HiderService _hiderService;
+
+    public VaultService Vault => _vaultService;
 
     public PKGManager(
         AppDbContext db,
@@ -36,8 +40,11 @@ public class PKGManager
         ArchiveService archiveService,
         ThumbnailService thumbnailService,
         CacheBuilderService cacheBuilderService,
-        MigrationService migrationService)
+        MigrationService migrationService,
+        VaultService vaultService,
+        Sims3HiderService hiderService)
     {
+        _hiderService = hiderService;
         _db = db;
         _optionsMonitor = options;
         _localizer = localizer;
@@ -46,6 +53,7 @@ public class PKGManager
         _thumbnailService = thumbnailService;
         _cacheBuilderService = cacheBuilderService;
         _migrationService = migrationService;
+        _vaultService = vaultService;
     }
 
     public async Task ScanLibraryDiskAsync(Action<string>? onProgress = null)
@@ -139,6 +147,11 @@ public class PKGManager
     public async Task<List<MetaEntity>> ImportFilesAsync(string[] files, Action<string>? onProgress = null, string duplicateAction = "rename", long? targetSetId = null)
     {
         CreateFolders();
+        if (_options.EnableSingleSourceVault)
+        {
+            return await ImportFilesToVaultAsync(files, onProgress, duplicateAction, targetSetId);
+        }
+
         var importedPaths = new List<string>();
 
         foreach (var filePath in files)
@@ -156,24 +169,13 @@ public class PKGManager
                 string ext = Path.GetExtension(fileName).ToLowerInvariant();
                 if (ext != ".package" && ext != ".sims3pack" && ext != ".world" && ext != ".sim") continue;
 
-                string destPath = Path.Combine(_options.ManagedPackageFolderPath, fileName);
+                var (destPath, shouldSkip) = ArchiveService.ResolveDestinationPath(
+                    _options.ManagedPackageFolderPath, fileName, duplicateAction, MarkExistingFileDirty);
 
-                if (File.Exists(destPath))
+                if (shouldSkip || destPath == null)
                 {
-                    if (string.Equals(duplicateAction, "skip", StringComparison.OrdinalIgnoreCase))
-                    {
-                        onProgress?.Invoke($"Skipped duplicate file: {fileName}");
-                        continue;
-                    }
-                    else if (string.Equals(duplicateAction, "replace", StringComparison.OrdinalIgnoreCase))
-                    {
-                        try { File.Delete(destPath); } catch { }
-                        MarkExistingFileDirty(fileName);
-                    }
-                    else
-                    {
-                        destPath = Path.Combine(_options.ManagedPackageFolderPath, Guid.NewGuid().ToString().Substring(0, 8) + "_" + fileName);
-                    }
+                    onProgress?.Invoke($"Skipped duplicate file: {fileName}");
+                    continue;
                 }
 
                 File.Copy(filePath, destPath, overwrite: true);
@@ -193,7 +195,135 @@ public class PKGManager
         return new List<MetaEntity>();
     }
 
+    public bool StaysInLibrary(string filePath)
+    {
+        string ext = Path.GetExtension(filePath);
+        if (ext.Equals(".world", StringComparison.OrdinalIgnoreCase) || ext.Equals(".sim", StringComparison.OrdinalIgnoreCase)) return true;
+        if (!ext.Equals(".package", StringComparison.OrdinalIgnoreCase)) return false;
+
+        try
+        {
+            return PackageTypeHelper.IsLibraryOnlyType(DetectPackageType(filePath, false).PackageType);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task<List<MetaEntity>> ImportFilesToVaultAsync(string[] files, Action<string>? onProgress, string duplicateAction, long? targetSetId)
+    {
+        string stagingDir = Path.Combine(Path.GetTempPath(), "PF_Vault_Import_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(stagingDir);
+        try
+        {
+            var stagedFiles = new List<string>();
+            foreach (var filePath in files)
+            {
+                if (!File.Exists(filePath)) continue;
+
+                if (IsArchiveExtension(filePath))
+                {
+                    // Each archive gets its own folder so same-named entries from different archives do not collide.
+                    string archiveDir = Path.Combine(stagingDir, Guid.NewGuid().ToString("N"));
+                    Directory.CreateDirectory(archiveDir);
+                    stagedFiles.AddRange(ExtractPackagesFromArchive(filePath, archiveDir, "overwrite", onProgress));
+                }
+                else
+                {
+                    string ext = Path.GetExtension(filePath).ToLowerInvariant();
+                    if (ext != ".package" && ext != ".sims3pack" && ext != ".world" && ext != ".sim") continue;
+
+                    string fileDir = Path.Combine(stagingDir, Guid.NewGuid().ToString("N"));
+                    Directory.CreateDirectory(fileDir);
+                    string staged = Path.Combine(fileDir, Path.GetFileName(filePath));
+                    File.Copy(filePath, staged, overwrite: true);
+                    stagedFiles.Add(staged);
+                }
+            }
+
+            var namesInBatch = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var toRegister = new List<string>();
+            foreach (var staged in stagedFiles)
+            {
+                string fileName = Path.GetFileName(staged);
+                bool duplicate = namesInBatch.Contains(fileName) || await _db.MetaEntities.AnyAsync(m => m.FileName == fileName);
+                string path = staged;
+
+                if (duplicate)
+                {
+                    bool replace = string.Equals(duplicateAction, "replace", StringComparison.OrdinalIgnoreCase);
+                    // "replace" replaces the existing item once; a second file of that name in the same batch is skipped.
+                    if (string.Equals(duplicateAction, "skip", StringComparison.OrdinalIgnoreCase) || (replace && namesInBatch.Contains(fileName)))
+                    {
+                        onProgress?.Invoke($"Skipped duplicate file: {fileName}");
+                        continue;
+                    }
+                    if (!replace)
+                    {
+                        // "rename": keep both, like the library import does.
+                        string uniqueName;
+                        do
+                        {
+                            uniqueName = $"{Guid.NewGuid().ToString("N")[..8]}_{fileName}";
+                        }
+                        while (await _db.MetaEntities.AnyAsync(m => m.FileName == uniqueName));
+                        path = Path.Combine(Path.GetDirectoryName(staged)!, uniqueName);
+                        File.Move(staged, path);
+                        fileName = uniqueName;
+                    }
+                }
+                namesInBatch.Add(fileName);
+
+                if (StaysInLibrary(path))
+                {
+                    bool replaceExisting = duplicate && string.Equals(duplicateAction, "replace", StringComparison.OrdinalIgnoreCase);
+                    var (destPath, shouldSkip) = ArchiveService.ResolveDestinationPath(_options.ManagedPackageFolderPath, fileName, replaceExisting ? "replace" : "rename");
+                    if (shouldSkip || destPath == null) continue;
+                    File.Move(path, destPath, overwrite: true);
+                    path = destPath;
+                }
+                toRegister.Add(path);
+                onProgress?.Invoke($"Imported file: {Path.GetFileName(path)}");
+            }
+
+            if (toRegister.Count == 0) return new List<MetaEntity>();
+
+            onProgress?.Invoke("Registering imported files...");
+            var registered = await RegisterSpecificFilesAsync(toRegister, targetSetId);
+
+            // Lots, Sims and worlds (also those inside a Sims3Pack) reach the game through the sync, not a shard.
+            var registeredIds = registered.Select(m => m.Id).ToList();
+            if (await _db.MetaEntities.AnyAsync(m => !m.IsVaultManaged && (registeredIds.Contains(m.Id) || (m.ParentMetaEntityId.HasValue && registeredIds.Contains(m.ParentMetaEntityId.Value)))))
+            {
+                await _cacheBuilderService.SyncToSims3Async(onProgress);
+            }
+
+            onProgress?.Invoke("Import finished.");
+            return registered;
+        }
+        finally
+        {
+            try { Directory.Delete(stagingDir, true); } catch { }
+        }
+    }
+
     public async Task<List<MetaEntity>> RegisterSpecificFilesAsync(IEnumerable<string> filePaths, long? targetSetId = null)
+    {
+        // The library scan registers files it finds on disk; holding its lock keeps it from registering a file
+        // that this import is still working on.
+        await _scanLock.WaitAsync();
+        try
+        {
+            return await RegisterSpecificFilesCoreAsync(filePaths, targetSetId);
+        }
+        finally
+        {
+            _scanLock.Release();
+        }
+    }
+
+    private async Task<List<MetaEntity>> RegisterSpecificFilesCoreAsync(IEnumerable<string> filePaths, long? targetSetId)
     {
         var result = new List<MetaEntity>();
         var validFilePaths = filePaths.Where(File.Exists).ToList();
@@ -212,14 +342,19 @@ public class PKGManager
         }
 
         var fileNames = validFilePaths.Select(Path.GetFileName).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        var existingMetas = await _db.MetaEntities
-            .Include(m => m.SetsEntity)
-            .Where(m => fileNames.Contains(m.FileName))
-            .ToDictionaryAsync(m => m.FileName, StringComparer.OrdinalIgnoreCase);
+        // FileName is not unique in the database, so never build the lookup with ToDictionary (it throws on a duplicate).
+        var existingMetas = new Dictionary<string, MetaEntity>(StringComparer.OrdinalIgnoreCase);
+        foreach (var m in await _db.MetaEntities.Include(m => m.SetsEntity).Where(m => fileNames.Contains(m.FileName)).OrderBy(m => m.Id).ToListAsync())
+        {
+            existingMetas.TryAdd(m.FileName, m);
+        }
 
-        var tombstones = await _db.Tombstones
-            .Where(t => fileNames.Contains(t.FileName))
-            .ToDictionaryAsync(t => t.FileName, StringComparer.OrdinalIgnoreCase);
+        var tombstones = new Dictionary<string, TombstoneEntity>(StringComparer.OrdinalIgnoreCase);
+        foreach (var t in await _db.Tombstones.Where(t => fileNames.Contains(t.FileName)).ToListAsync())
+        {
+            tombstones.TryAdd(t.FileName, t);
+        }
+        var replacedLibrarySetIds = new HashSet<long>();
 
         foreach (var filePath in validFilePaths)
         {
@@ -228,23 +363,55 @@ public class PKGManager
             var fileInfo = new FileInfo(filePath);
             double currentSizeKb = fileInfo.Length / 1024.0;
             bool isSims3Pack = Path.GetExtension(fileName).Equals(".sims3pack", StringComparison.OrdinalIgnoreCase);
+            // Lots, Sims and worlds are never stored in shards; they stay regular library items.
+            bool goesToVault = _options.EnableSingleSourceVault && (isSims3Pack || !StaysInLibrary(filePath));
 
             if (existingMeta == null)
             {
-                if (!isSims3Pack && _options.CompressionLevel > 0)
+                if (goesToVault)
                 {
+                    tombstones.TryGetValue(fileName, out var vaultTombstone);
+                    var vaultTargetSet = (vaultTombstone != null && vaultTombstone.SetsEntityId.HasValue && setEntitiesById.TryGetValue(vaultTombstone.SetsEntityId.Value, out var vSetFromTombstone))
+                        ? vSetFromTombstone
+                        : assignSet;
+
                     try
                     {
-                        if (DBPFPackage.OptimizePackage(filePath, _options.CompressionLevel))
+                        MetaEntity? imported = isSims3Pack
+                            ? await _vaultService.ImportSims3PackDirectAsync(filePath, vaultTargetSet)
+                            : await _vaultService.ImportPackageDirectAsync(filePath, vaultTargetSet);
+
+                        if (imported != null)
                         {
-                            fileInfo.Refresh();
-                            currentSizeKb = fileInfo.Length / 1024.0;
+                            if (vaultTombstone != null)
+                            {
+                                if (!isSims3Pack) imported.PackageType = vaultTombstone.PackageType;
+                                if (!isSims3Pack) imported.CASCategories = vaultTombstone.CASCategories;
+                                if (!isSims3Pack) imported.CASAge = vaultTombstone.CASAge;
+                                if (!isSims3Pack) imported.CASGender = vaultTombstone.CASGender;
+                                if (!isSims3Pack) imported.CASOutfitCategory = vaultTombstone.CASOutfitCategory;
+                                imported.IsUserTagged = vaultTombstone.IsUserTagged;
+                                imported.UserTags = vaultTombstone.UserTags;
+                                imported.Description = vaultTombstone.Description ?? string.Empty;
+                                imported.IsFavorite = vaultTombstone.IsFavorite;
+                                _db.Tombstones.Remove(vaultTombstone);
+                                tombstones.Remove(fileName);
+                                await _db.SaveChangesAsync();
+                            }
+
+                            result.Add(imported);
+                            existingMetas[fileName] = imported;
+                            try { if (File.Exists(filePath)) File.Delete(filePath); } catch { }
                         }
                     }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        AppLogger.LogError($"Failed to direct-import {fileName} to vault: {ex.Message}", ex, "PKGManager");
+                    }
+                    continue;
                 }
 
-                (string PackageType, string CASCategories, string CASAge, string CASGender, string CASOutfitCategory) typeInfo = ("Other", "", "", "", "");
+                PackageTypeInfo typeInfo = PackageTypeInfo.Other;
                 try
                 {
                     typeInfo = DetectPackageType(filePath, isSims3Pack);
@@ -277,6 +444,7 @@ public class PKGManager
                     FileSize = currentSizeKb,
                     Filehash = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}"
                 };
+                typeInfo.ApplyBuildBuyTo(meta);
 
                 if (tombstone != null)
                 {
@@ -291,15 +459,48 @@ public class PKGManager
             }
             else
             {
+                if (existingMeta.IsVaultManaged)
+                {
+                    bool replaced = false;
+                    try
+                    {
+                        replaced = await _vaultService.ReplaceModAsync(existingMeta.Id, filePath);
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLogger.LogError($"Failed to direct-replace vault item {fileName}: {ex.Message}", ex, "PKGManager");
+                    }
+
+                    if (replaced)
+                    {
+                        try { File.Delete(filePath); } catch { }
+                        result.Add(existingMeta);
+                    }
+                    else
+                    {
+                        // The vault still holds the previous version; the source file is left where the user had it.
+                        AppLogger.LogError($"Could not replace vault item {fileName}; the vault keeps the previous version", null, "PKGManager");
+                    }
+                    continue;
+                }
+
                 existingMeta.FileSize = currentSizeKb;
                 existingMeta.Filehash = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}";
                 existingMeta.CompleteFileName = filePath;
                 if (existingMeta.SetsEntity != null) existingMeta.SetsEntity.Dirty = true;
+                if (existingMeta.SetsEntityId.HasValue) replacedLibrarySetIds.Add(existingMeta.SetsEntityId.Value);
                 result.Add(existingMeta);
             }
         }
 
         await _db.SaveChangesAsync();
+
+        // Hider packages hold copies of the replaced mods' object definitions.
+        if (replacedLibrarySetIds.Count > 0)
+        {
+            try { await _hiderService.RefreshHidersForSetsAsync(replacedLibrarySetIds); }
+            catch (Exception ex) { AppLogger.LogWarning($"Could not refresh hider packages after a replace: {ex.Message}", ex, "PKGManager"); }
+        }
         return result;
     }
 
@@ -420,6 +621,19 @@ public class PKGManager
 
             string fileName = Path.GetFileName(file);
 
+            if (_options.EnableSingleSourceVault)
+            {
+                // Archives and single files alike: ImportFilesAsync stages a copy and honours the duplicate choice.
+                var importedMetas = await ImportFilesAsync(new[] { file }, onProgress, duplicateAction);
+                if (importedMetas.Count > 0)
+                {
+                    importedCount += importedMetas.Count;
+                    // ImportFilesAsync works on a copy; remove the original so it is not imported again next time.
+                    try { File.Delete(file); } catch { }
+                }
+                continue;
+            }
+
             if (IsArchiveExtension(fileName))
             {
                 var extracted = ExtractPackagesFromArchive(file, _options.ManagedPackageFolderPath, duplicateAction, onProgress);
@@ -431,24 +645,13 @@ public class PKGManager
             }
             else
             {
-                string destPath = Path.Combine(_options.ManagedPackageFolderPath, fileName);
+                var (destPath, shouldSkip) = ArchiveService.ResolveDestinationPath(
+                    _options.ManagedPackageFolderPath, fileName, duplicateAction, MarkExistingFileDirty);
 
-                if (File.Exists(destPath))
+                if (shouldSkip || destPath == null)
                 {
-                    if (string.Equals(duplicateAction, "skip", StringComparison.OrdinalIgnoreCase))
-                    {
-                        onProgress?.Invoke($"Skipped duplicate file: {fileName}");
-                        continue;
-                    }
-                    else if (string.Equals(duplicateAction, "replace", StringComparison.OrdinalIgnoreCase))
-                    {
-                        try { File.Delete(destPath); } catch { }
-                        MarkExistingFileDirty(fileName);
-                    }
-                    else
-                    {
-                        destPath = Path.Combine(_options.ManagedPackageFolderPath, Guid.NewGuid().ToString().Substring(0, 8) + "_" + fileName);
-                    }
+                    onProgress?.Invoke($"Skipped duplicate file: {fileName}");
+                    continue;
                 }
 
                 try
@@ -466,9 +669,12 @@ public class PKGManager
 
         if (importedCount > 0)
         {
-            progress?.UpdateStep(stepId, title: _localizer.GetString("progress.registering_imported_files"));
-            onProgress?.Invoke("Registering imported files...");
-            await CheckOrphanPackagesAsync();
+            if (!_options.EnableSingleSourceVault)
+            {
+                progress?.UpdateStep(stepId, title: _localizer.GetString("progress.registering_imported_files"));
+                onProgress?.Invoke("Registering imported files...");
+                await CheckOrphanPackagesAsync();
+            }
             onProgress?.Invoke("Import finished.");
         }
 
@@ -585,8 +791,11 @@ public class PKGManager
 
             var metaEntities = await _db.MetaEntities.ToListAsync();
 
-            // Self-healing: Deduplicate any existing duplicate MetaEntities by FileName
+            // Self-healing: Deduplicate any existing duplicate library MetaEntities by FileName.
+            // Vault items are never touched here: their data lives in shards, not in the library folder, and deleting
+            // one would cascade to its chunk records.
             var duplicateGroups = metaEntities
+                .Where(m => !m.IsVaultManaged)
                 .GroupBy(m => m.FileName, StringComparer.OrdinalIgnoreCase)
                 .Where(g => g.Count() > 1)
                 .ToList();
@@ -627,8 +836,9 @@ public class PKGManager
                 }
             }
 
+            // Library items first, so a library file is matched to its own record even if a vault item shares the name.
             var metaMap = new Dictionary<string, MetaEntity>(StringComparer.OrdinalIgnoreCase);
-            foreach (var m in metaEntities)
+            foreach (var m in metaEntities.OrderBy(m => m.IsVaultManaged))
             {
                 if (!metaMap.ContainsKey(m.FileName)) metaMap[m.FileName] = m;
             }
@@ -649,12 +859,36 @@ public class PKGManager
                 .ToList();
 
             var diskFileMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var file in currentFilesOnDisk)
+            // Items are identified by file name, so a second file with the same name in another sub-folder would never
+            // be registered. Give it a unique name, the same way an import keeps both copies. Files a library record
+            // already points at keep their names. (A file named like a vault item is left alone: during a migration the
+            // library copy of a just-migrated item is still on disk until it is backed up.)
+            var knownLibraryPaths = metaEntities.Where(m => !m.IsVaultManaged && !string.IsNullOrEmpty(m.CompleteFileName))
+                .Select(m => m.CompleteFileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in currentFilesOnDisk.OrderBy(f => knownLibraryPaths.Contains(f) ? 0 : 1))
             {
                 string fn = Path.GetFileName(file);
                 if (!diskFileMap.ContainsKey(fn))
                 {
                     diskFileMap[fn] = file;
+                    continue;
+                }
+
+                try
+                {
+                    string uniquePath;
+                    do
+                    {
+                        uniquePath = Path.Combine(Path.GetDirectoryName(file)!, $"{Guid.NewGuid().ToString("N")[..8]}_{fn}");
+                    }
+                    while (File.Exists(uniquePath));
+                    File.Move(file, uniquePath);
+                    diskFileMap[Path.GetFileName(uniquePath)] = uniquePath;
+                    AppLogger.LogWarning($"[CheckOrphanPackages] Renamed '{file}' to '{Path.GetFileName(uniquePath)}': another item already has the name '{fn}'.");
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.LogWarning($"[CheckOrphanPackages] '{file}' has the same name as another library file and could not be renamed: {ex.Message}");
                 }
             }
 
@@ -668,7 +902,7 @@ public class PKGManager
                 return;
             }
 
-            var toRemoveFromDb = metaEntities.Where(m => !diskFileMap.ContainsKey(m.FileName)).ToList();
+            var toRemoveFromDb = metaEntities.Where(m => !m.IsVaultManaged && !diskFileMap.ContainsKey(m.FileName)).ToList();
             if (toRemoveFromDb.Count > 0)
             {
                 var setIdsToDirty = toRemoveFromDb.Where(m => m.SetsEntityId.HasValue).Select(m => m.SetsEntityId!.Value).Distinct().ToList();
@@ -697,7 +931,7 @@ public class PKGManager
                 {
                     bool isSims3Pack = Path.GetExtension(fileName).Equals(".sims3pack", StringComparison.OrdinalIgnoreCase);
 
-                    (string PackageType, string CASCategories, string CASAge, string CASGender, string CASOutfitCategory) typeInfo = ("Other", "", "", "", "");
+                    PackageTypeInfo typeInfo = PackageTypeInfo.Other;
                     try
                     {
                         typeInfo = DetectPackageType(filePath, isSims3Pack);
@@ -733,6 +967,7 @@ public class PKGManager
                         FileSize = currentSizeKb,
                         Filehash = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}"
                     };
+                    typeInfo.ApplyBuildBuyTo(meta);
 
                     if (tombstone != null)
                     {
@@ -751,6 +986,11 @@ public class PKGManager
                 }
                 else
                 {
+                    if (existingMeta.IsVaultManaged)
+                    {
+                        continue;
+                    }
+
                     bool isSims3Pack = Path.GetExtension(fileName).Equals(".sims3pack", StringComparison.OrdinalIgnoreCase);
                     string currentSig = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}";
                     bool sizeChanged = Math.Abs(existingMeta.FileSize - currentSizeKb) > 0.01;
@@ -764,7 +1004,7 @@ public class PKGManager
                             _thumbnailService.DeleteThumbnail(existingMeta.Id);
                         }
 
-                        (string PackageType, string CASCategories, string CASAge, string CASGender, string CASOutfitCategory) typeInfo = ("Other", "", "", "", "");
+                        PackageTypeInfo typeInfo = PackageTypeInfo.Other;
                         try
                         {
                             typeInfo = DetectPackageType(filePath, isSims3Pack);
@@ -780,6 +1020,7 @@ public class PKGManager
                             existingMeta.CASGender = typeInfo.CASGender;
                             existingMeta.CASOutfitCategory = typeInfo.CASOutfitCategory;
                         }
+                        typeInfo.ApplyBuildBuyTo(existingMeta);
                         existingMeta.CompleteFileName = filePath;
                         existingMeta.FileSize = currentSizeKb;
                         existingMeta.Filehash = currentSig;
@@ -902,9 +1143,11 @@ public class PKGManager
         string currentSig = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}";
         bool isSims3Pack = Path.GetExtension(meta.FileName).Equals(".sims3pack", StringComparison.OrdinalIgnoreCase);
 
+        // 1. Delete thumbnail cache from disk (which also clears memory cache via event)
         _thumbnailService.DeleteThumbnail(meta.Id);
 
-        (string PackageType, string CASCategories, string CASAge, string CASGender, string CASOutfitCategory) typeInfo = ("Other", "", "", "", "");
+        // 2. Re-detect package type & metadata
+        PackageTypeInfo typeInfo = PackageTypeInfo.Other;
         try
         {
             typeInfo = DetectPackageType(meta.CompleteFileName, isSims3Pack);
@@ -923,9 +1166,11 @@ public class PKGManager
             meta.CASGender = typeInfo.CASGender;
             meta.CASOutfitCategory = typeInfo.CASOutfitCategory;
         }
+        typeInfo.ApplyBuildBuyTo(meta);
         meta.FileSize = currentSizeKb;
         meta.Filehash = currentSig;
 
+        // 3. Immediately re-extract fresh thumbnail to disk
         await _thumbnailService.GetThumbnailPathAsync(meta.Id);
 
         if (meta.SetsEntity != null)
@@ -937,83 +1182,96 @@ public class PKGManager
         return true;
     }
 
-    public (string PackageType, string CASCategories, string CASAge, string CASGender, string CASOutfitCategory) DetectPackageType(string filePath, bool isSims3Pack)
+    public PackageTypeInfo DetectPackageType(string filePath, bool isSims3Pack)
         => _packageTypeService.DetectPackageType(filePath, isSims3Pack);
 
     public async Task<(int TotalScanned, int UpdatedCount)> RecheckPackageTypesAsync(Action<string>? onProgress = null, bool skipUserTagged = true, ITaskProgressReporter? progress = null)
         => await _packageTypeService.RecheckPackageTypesAsync(onProgress, skipUserTagged, progress);
 
-    public async Task<(int optimizedCount, long bytesSaved)> OptimizeLibraryAsync(Action<string>? onProgress = null, ITaskProgressReporter? progress = null)
+    public async Task<int> RepairLegacyCompressionAsync(Action<string>? onProgress = null, ITaskProgressReporter? progress = null)
     {
-        string stepId = "optimize_library";
-        progress?.StartStep(stepId, "Optimizing library packages...", progress: 0.0);
-        onProgress?.Invoke("Scanning library for uncompressed packages...");
+        const string stepId = "repair_compression";
+        progress?.StartStep(stepId, _localizer.GetString("progress.repairing_library_compression"), badge: _localizer.GetString("progress.badge_initializing"), progress: 0.0);
+        onProgress?.Invoke(_localizer.GetString("progress.repairing_library_compression"));
 
-        if (!Directory.Exists(_options.ManagedPackageFolderPath))
+        // Hold the scan lock so the Library watcher doesn't rescan files mid-rewrite.
+        await _scanLock.WaitAsync();
+        try
         {
-            progress?.CompleteStep(stepId, finalBadge: "Library empty");
-            return (0, 0);
-        }
+            var metas = await _db.MetaEntities
+                .Include(m => m.SetsEntity)
+                .Where(m => !m.IsVaultManaged)
+                .ToListAsync();
 
-        var files = Directory.GetFiles(_options.ManagedPackageFolderPath, "*.package", SearchOption.AllDirectories);
-        int total = files.Length;
-        int current = 0;
-        int optimizedCount = 0;
-        long totalBytesSaved = 0;
-        int reportInterval = Math.Max(1, total / 50);
-
-        var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1) };
-
-        await Task.Run(() =>
-        {
-            Parallel.ForEach(files, parallelOptions, filePath =>
+            // Import compressed everything except .sims3pack, so .world and .sim files need repair too.
+            var metasByPath = new Dictionary<string, List<MetaEntity>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var meta in metas)
             {
-                int index = Interlocked.Increment(ref current);
-                if (index % reportInterval == 0 || index == total)
+                string path = meta.CompleteFileName;
+                if (string.IsNullOrEmpty(path) || !File.Exists(path))
                 {
-                    double pct = total > 0 ? (double)index / total : 1.0;
-                    string badge = $"{index}/{total}";
-                    progress?.UpdateStep(stepId, progress: pct, badge: badge);
-                    onProgress?.Invoke($"Optimizing packages ({index}/{total})...");
+                    path = Path.Combine(_options.ManagedPackageFolderPath, meta.FileName);
+                    if (!File.Exists(path)) continue;
                 }
 
-                try
+                string ext = Path.GetExtension(path);
+                if (!ext.Equals(".package", StringComparison.OrdinalIgnoreCase) &&
+                    !ext.Equals(".world", StringComparison.OrdinalIgnoreCase) &&
+                    !ext.Equals(".sim", StringComparison.OrdinalIgnoreCase)) continue;
+
+                if (!metasByPath.TryGetValue(path, out var list))
                 {
-                    long beforeSize = new FileInfo(filePath).Length;
-                    if (DBPFPackage.OptimizePackage(filePath, _options.CompressionLevel > 0 ? _options.CompressionLevel : 1))
+                    list = new List<MetaEntity>();
+                    metasByPath[path] = list;
+                }
+                list.Add(meta);
+            }
+
+            var paths = metasByPath.Keys.ToList();
+            int total = paths.Count;
+            int current = 0;
+            int reportInterval = Math.Max(1, total / 50);
+            var repairedPaths = new System.Collections.Concurrent.ConcurrentBag<string>();
+            var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1) };
+
+            await Task.Run(() =>
+            {
+                Parallel.ForEach(paths, parallelOptions, path =>
+                {
+                    int index = Interlocked.Increment(ref current);
+                    if (index % reportInterval == 0 || index == total)
                     {
-                        long afterSize = new FileInfo(filePath).Length;
-                        long saved = beforeSize - afterSize;
-                        if (saved > 0)
-                        {
-                            Interlocked.Add(ref totalBytesSaved, saved);
-                        }
-                        Interlocked.Increment(ref optimizedCount);
+                        double pct = total > 0 ? (double)index / total : 1.0;
+                        progress?.UpdateStep(stepId, progress: pct, badge: $"{index}/{total}");
                     }
-                }
-                catch { }
-            });
-        });
 
-        if (optimizedCount > 0)
-        {
-            onProgress?.Invoke("Updating database file sizes...");
-            var allMetas = await _db.MetaEntities.Where(m => m.FileType == "DBPF").ToListAsync();
-            foreach (var meta in allMetas)
+                    if (LegacyCompressionRepair.RepairPackage(path))
+                    {
+                        repairedPaths.Add(path);
+                    }
+                });
+            });
+
+            foreach (string path in repairedPaths)
             {
-                if (File.Exists(meta.CompleteFileName))
+                var fileInfo = new FileInfo(path);
+                foreach (var meta in metasByPath[path])
                 {
-                    meta.FileSize = new FileInfo(meta.CompleteFileName).Length / 1024.0;
+                    meta.FileSize = fileInfo.Length / 1024.0;
+                    meta.Filehash = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}";
+                    if (meta.SetsEntity != null) meta.SetsEntity.Dirty = true;
                 }
             }
             await _db.SaveChangesAsync();
+
+            int repairedCount = repairedPaths.Count;
+            progress?.CompleteStep(stepId, finalBadge: _localizer.GetString("progress.repaired_badge", repairedCount));
+            onProgress?.Invoke(_localizer.GetString("progress.repaired_badge", repairedCount));
+            return repairedCount;
         }
-
-        double mbSaved = totalBytesSaved / (1024.0 * 1024.0);
-        string resultMsg = $"Optimized {optimizedCount} packages, saving {mbSaved:F2} MB of disk space.";
-        onProgress?.Invoke(resultMsg);
-        progress?.CompleteStep(stepId, finalBadge: $"{optimizedCount} optimized ({mbSaved:F1} MB saved)");
-
-        return (optimizedCount, totalBytesSaved);
+        finally
+        {
+            _scanLock.Release();
+        }
     }
 }
