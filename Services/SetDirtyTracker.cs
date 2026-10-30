@@ -24,8 +24,11 @@ public static class SetDirtyTracker
               .Append(':')
               .Append(item.Filehash)
               .Append(':')
-              .Append(item.Enabled ? "1" : "0")
-              .Append(';');
+              .Append(item.Enabled ? "1" : "0");
+            // Only appended when set, so hashes of existing sets stay the same.
+            if (item.SkipTextureOptimization) sb.Append(":NT");
+            if (item.DisabledObjectCount > 0) sb.Append(":X").Append(item.DisabledObjectsStamp);
+            sb.Append(';');
         }
 
         using var sha = SHA256.Create();
@@ -35,7 +38,8 @@ public static class SetDirtyTracker
 
     public static string ComputeContentHash(SetsEntity set)
     {
-        return ComputeContentHash(set.FolderName ?? set.Name, set.MetaEntities ?? Enumerable.Empty<MetaEntity>());
+        // The cache folder is named after the set's id, so renaming a set does not change what has to be built.
+        return ComputeContentHash(CacheBuilderService.GetSetFolderName(set.Id), set.MetaEntities ?? Enumerable.Empty<MetaEntity>());
     }
 
     public static void UpdateDirtyState(SetsEntity set)
