@@ -12,20 +12,42 @@ public static class AppLogger
 {
     private static readonly object _fileLock = new();
     private static string? _customLogsDirectory;
-    private const long MaxLogFileSize = 5 * 1024 * 1024; // 5 MB cap
+    private static string? _cachedLogsDirectory;
+
+    private static string? _mainLogPath;
+    private static string? _oldLogPath;
+    private static string? _errorsLogPath;
+    private static string? _oldErrorsLogPath;
+    private static string? _fatalLogPath;
+    private static string? _oldFatalLogPath;
+
+    private static long _mainLogSize = -1;
+    private static long _errorsLogSize = -1;
+
+    private const long MaxLogFileSize = 5 * 1024 * 1024;    // 5 MB cap for main log
+    private const long MaxErrorsLogFileSize = 2 * 1024 * 1024; // 2 MB cap for errors log
+
+    // Deduplication / flood protection tracking
+    private static string? _lastSignature;
+    private static int _repeatedCount = 0;
+    private static DateTime _lastRepeatTime = DateTime.MinValue;
+
+    public static LogLevel MinimumLogLevel { get; set; } = LogLevel.Information;
 
     public static string LogsDirectory
     {
         get
         {
-            if (!string.IsNullOrWhiteSpace(_customLogsDirectory) && Directory.Exists(_customLogsDirectory))
+            if (!string.IsNullOrWhiteSpace(_customLogsDirectory))
             {
                 return _customLogsDirectory;
             }
 
-            return ResolveDefaultLogsDirectory();
+            return _cachedLogsDirectory ??= ResolveDefaultLogsDirectory();
         }
     }
+
+    public static string ErrorsLogPath => _errorsLogPath ?? Path.Combine(LogsDirectory, "errors.log");
 
     public static void Initialize(string? customBaseDir = null)
     {
@@ -36,13 +58,43 @@ public static class AppLogger
                 var dir = Path.Combine(customBaseDir, "Logs");
                 Directory.CreateDirectory(dir);
                 _customLogsDirectory = dir;
+                _cachedLogsDirectory = dir;
             }
             else
             {
                 _customLogsDirectory = ResolveDefaultLogsDirectory();
+                _cachedLogsDirectory = _customLogsDirectory;
             }
 
+            UpdateCachedFilePaths(_cachedLogsDirectory);
             CleanupLegacyDateLogs();
+
+            // Bridge S3ForgeTools internal logger so errors and warnings from package
+            // parsers and Sims3 services are captured in plumbobforge.log and errors.log.
+            S3ForgeTools.Utils.Logging.LogManager.OnLogEntry = (level, module, message) =>
+            {
+                switch (level)
+                {
+                    case S3ForgeTools.Utils.Logging.LogManager.LogLevel.Fatal:
+                        LogFatal($"[{module}] {message}", null);
+                        break;
+                    case S3ForgeTools.Utils.Logging.LogManager.LogLevel.Error:
+                        LogError(message, null, module);
+                        break;
+                    case S3ForgeTools.Utils.Logging.LogManager.LogLevel.Warn:
+                        LogWarning(message, null, module);
+                        break;
+                    case S3ForgeTools.Utils.Logging.LogManager.LogLevel.Info:
+                        LogInfo(message, module);
+                        break;
+                    case S3ForgeTools.Utils.Logging.LogManager.LogLevel.Debug:
+                        LogDebug(message, module);
+                        break;
+                }
+            };
+
+            // Write diagnostic startup banner
+            WriteStartupBanner();
         }
         catch { }
     }
@@ -55,10 +107,25 @@ public static class AppLogger
             {
                 Directory.CreateDirectory(dirPath);
                 _customLogsDirectory = dirPath;
+                _cachedLogsDirectory = dirPath;
+                UpdateCachedFilePaths(dirPath);
                 CleanupLegacyDateLogs();
             }
         }
         catch { }
+    }
+
+    private static void UpdateCachedFilePaths(string dir)
+    {
+        _mainLogPath = Path.Combine(dir, "plumbobforge.log");
+        _oldLogPath = Path.Combine(dir, "plumbobforge.old.log");
+        _errorsLogPath = Path.Combine(dir, "errors.log");
+        _oldErrorsLogPath = Path.Combine(dir, "errors.old.log");
+        _fatalLogPath = Path.Combine(dir, "fatal_crash.log");
+        _oldFatalLogPath = Path.Combine(dir, "fatal_crash.old.log");
+
+        _mainLogSize = -1;
+        _errorsLogSize = -1;
     }
 
     private static string ResolveDefaultLogsDirectory()
@@ -80,6 +147,7 @@ public static class AppLogger
                 {
                     var customLogsDir = Path.Combine(docBaseDir, "Logs");
                     Directory.CreateDirectory(customLogsDir);
+                    UpdateCachedFilePaths(customLogsDir);
                     return customLogsDir;
                 }
             }
@@ -94,6 +162,7 @@ public static class AppLogger
                 "PlumbobForge",
                 "Logs");
             Directory.CreateDirectory(defaultDocBase);
+            UpdateCachedFilePaths(defaultDocBase);
             return defaultDocBase;
         }
         catch { }
@@ -106,27 +175,58 @@ public static class AppLogger
                 "PlumbobForge",
                 "Logs");
             Directory.CreateDirectory(localAppData);
+            UpdateCachedFilePaths(localAppData);
             return localAppData;
         }
         catch { }
 
         // 4. Base directory fallback
+        UpdateCachedFilePaths(AppContext.BaseDirectory);
         return AppContext.BaseDirectory;
+    }
+
+    private static void WriteStartupBanner()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("================================================================================");
+        sb.AppendLine($"PlumbobForge Desktop v{GetAppVersion()} Started: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        sb.AppendLine($"OS: {RuntimeInformation.OSDescription} ({RuntimeInformation.OSArchitecture}) | Runtime: {RuntimeInformation.FrameworkDescription}");
+        sb.AppendLine($"BaseDir: {AppContext.BaseDirectory}");
+        sb.AppendLine($"LogsDir: {LogsDirectory}");
+        sb.AppendLine("================================================================================");
+        WriteRaw(sb.ToString(), isError: false);
+    }
+
+    public static void LogDebug(string message, string? category = null)
+    {
+        if (MinimumLogLevel <= LogLevel.Debug)
+        {
+            WriteEntry("DEBUG", category, message, null);
+        }
     }
 
     public static void LogInfo(string message, string? category = null)
     {
-        WriteEntry("INFO", category, message, null);
+        if (MinimumLogLevel <= LogLevel.Information)
+        {
+            WriteEntry("INFO", category, message, null);
+        }
     }
 
     public static void LogWarning(string message, Exception? ex = null, string? category = null)
     {
-        WriteEntry("WARN", category, message, ex);
+        if (MinimumLogLevel <= LogLevel.Warning)
+        {
+            WriteEntry("WARN", category, message, ex);
+        }
     }
 
     public static void LogError(string message, Exception? ex = null, string? category = null)
     {
-        WriteEntry("ERROR", category, message, ex);
+        if (MinimumLogLevel <= LogLevel.Error)
+        {
+            WriteEntry("ERROR", category, message, ex);
+        }
     }
 
     public static void LogFatal(string prefix, Exception? ex)
@@ -161,18 +261,22 @@ public static class AppLogger
         {
             try
             {
-                var logsDir = LogsDirectory;
-                Directory.CreateDirectory(logsDir);
+                EnsurePathsInitialized();
 
-                // Write to main persistent log with rotation check
-                AppendWithRotation(Path.Combine(logsDir, "plumbobforge.log"), Path.Combine(logsDir, "plumbobforge.old.log"), logText);
+                // Flush any pending repeat counts
+                FlushRepeatedMessage();
 
-                // Write to dedicated fatal_crash.log with rotation check
-                AppendWithRotation(Path.Combine(logsDir, "fatal_crash.log"), Path.Combine(logsDir, "fatal_crash.old.log"), logText);
+                // Write to main persistent log
+                AppendWithRotation(_mainLogPath!, _oldLogPath!, logText, ref _mainLogSize, MaxLogFileSize);
+
+                // Write to dedicated errors.log
+                AppendWithRotation(_errorsLogPath!, _oldErrorsLogPath!, logText, ref _errorsLogSize, MaxErrorsLogFileSize);
+
+                // Write to dedicated fatal_crash.log
+                AppendWithRotation(_fatalLogPath!, _oldFatalLogPath!, logText, ref _mainLogSize, MaxLogFileSize);
             }
             catch
             {
-                // Fallback to app directory if documents inaccessible
                 try
                 {
                     File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "fatal_crash.log"), logText);
@@ -184,67 +288,144 @@ public static class AppLogger
 
     public static void WriteEntry(string level, string? category, string message, Exception? ex)
     {
-        var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
         var cat = string.IsNullOrWhiteSpace(category) ? "App" : category;
-
-        var sb = new StringBuilder();
-        sb.Append($"[{timestamp}] [{level,-5}] [{cat}] {message}");
-
-        if (ex != null)
-        {
-            sb.AppendLine();
-            sb.Append(FormatDetailedException(ex));
-        }
-        sb.AppendLine();
-
-        var logText = sb.ToString();
-
-        // Echo to Console
-        if (level == "ERROR" || level == "FATAL")
-        {
-            Console.Error.Write(logText);
-        }
-        else
-        {
-            Console.Write(logText);
-        }
+        bool isWarningOrError = level is "WARN" or "ERROR" or "FATAL";
 
         lock (_fileLock)
         {
-            try
+            // Flood protection / message deduplication:
+            // If the same log line repeats rapidly in a loop, suppress and count it.
+            string signature = $"{level}|{cat}|{message}";
+            var now = DateTime.UtcNow;
+
+            if (signature == _lastSignature && (now - _lastRepeatTime).TotalSeconds < 5)
             {
-                var logsDir = LogsDirectory;
-                Directory.CreateDirectory(logsDir);
-
-                var mainLogPath = Path.Combine(logsDir, "plumbobforge.log");
-                var oldLogPath = Path.Combine(logsDir, "plumbobforge.old.log");
-
-                AppendWithRotation(mainLogPath, oldLogPath, logText);
+                _repeatedCount++;
+                _lastRepeatTime = now;
+                if (_repeatedCount < 3)
+                {
+                    // Allow first 2 repeats through for immediate visibility
+                }
+                else
+                {
+                    // Suppress subsequent repeats until a different message arrives or 25 repeats occur
+                    if (_repeatedCount % 25 == 0)
+                    {
+                        var repeatMsg = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [{level,-5}] [{cat}] ... [Previous message repeated {_repeatedCount} times]\n";
+                        WriteRaw(repeatMsg, isWarningOrError);
+                    }
+                    return;
+                }
             }
-            catch { }
+            else
+            {
+                if (_repeatedCount >= 3)
+                {
+                    var repeatSummary = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [{level,-5}] [{cat}] ... [Previous message repeated {_repeatedCount} times]\n";
+                    WriteRaw(repeatSummary, isWarningOrError);
+                }
+                _lastSignature = signature;
+                _repeatedCount = 1;
+                _lastRepeatTime = now;
+            }
+
+            var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
+            var sb = new StringBuilder();
+            sb.Append($"[{timestamp}] [{level,-5}] [{cat}] {message}");
+
+            if (ex != null)
+            {
+                sb.AppendLine();
+                sb.Append(FormatDetailedException(ex));
+            }
+            sb.AppendLine();
+
+            var logText = sb.ToString();
+
+            // Echo to Console
+            if (isWarningOrError)
+            {
+                Console.Error.Write(logText);
+            }
+            else
+            {
+                Console.Write(logText);
+            }
+
+            WriteRaw(logText, isWarningOrError);
         }
     }
 
-    private static void AppendWithRotation(string currentLogPath, string rotatedLogPath, string content)
+    private static void FlushRepeatedMessage()
+    {
+        if (_repeatedCount >= 3 && _lastSignature != null)
+        {
+            var repeatSummary = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [INFO ] [App] ... [Previous message repeated {_repeatedCount} times]\n";
+            WriteRaw(repeatSummary, isError: false);
+            _repeatedCount = 0;
+            _lastSignature = null;
+        }
+    }
+
+    private static void WriteRaw(string content, bool isError)
     {
         try
         {
-            if (File.Exists(currentLogPath))
+            EnsurePathsInitialized();
+
+            // Write to main persistent log
+            AppendWithRotation(_mainLogPath!, _oldLogPath!, content, ref _mainLogSize, MaxLogFileSize);
+
+            // Write to dedicated errors.log for pure, high-signal warning/error tracking
+            if (isError)
             {
-                var info = new FileInfo(currentLogPath);
-                if (info.Length > MaxLogFileSize)
+                AppendWithRotation(_errorsLogPath!, _oldErrorsLogPath!, content, ref _errorsLogSize, MaxErrorsLogFileSize);
+            }
+        }
+        catch { }
+    }
+
+    private static void EnsurePathsInitialized()
+    {
+        if (_mainLogPath == null)
+        {
+            var dir = LogsDirectory;
+            UpdateCachedFilePaths(dir);
+        }
+    }
+
+    private static void AppendWithRotation(
+        string currentLogPath,
+        string rotatedLogPath,
+        string content,
+        ref long currentSize,
+        long maxFileSize)
+    {
+        try
+        {
+            if (currentSize < 0)
+            {
+                currentSize = File.Exists(currentLogPath) ? new FileInfo(currentLogPath).Length : 0;
+            }
+
+            if (currentSize + content.Length > maxFileSize)
+            {
+                try
                 {
-                    try
-                    {
-                        File.Move(currentLogPath, rotatedLogPath, overwrite: true);
-                    }
-                    catch { }
+                    File.Move(currentLogPath, rotatedLogPath, overwrite: true);
+                    currentSize = 0;
                 }
+                catch { }
             }
 
             File.AppendAllText(currentLogPath, content);
+            currentSize += content.Length;
         }
-        catch { }
+        catch
+        {
+            // If caching had a stale size, reset to re-read on next attempt
+            currentSize = -1;
+        }
     }
 
     public static string FormatDetailedException(Exception ex, int depth = 0)
@@ -326,7 +507,7 @@ public static class AppLogger
             var dir = LogsDirectory;
             if (!Directory.Exists(dir)) return;
 
-            // Remove any legacy date-stamped files like plumbobforge-2026-08-28.log
+            // Remove legacy date-stamped files like plumbobforge-2026-08-28.log
             var oldDateFiles = Directory.GetFiles(dir, "plumbobforge-*.log");
             foreach (var file in oldDateFiles)
             {
@@ -358,7 +539,26 @@ public class FileLogger : ILogger
 
     public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
-    public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+    public bool IsEnabled(LogLevel logLevel)
+    {
+        if (logLevel == LogLevel.None) return false;
+        if (logLevel < AppLogger.MinimumLogLevel) return false;
+
+        // Filter out noisy framework logs below Warning level (e.g. EF Core SQL query dumps)
+        if (logLevel < LogLevel.Warning)
+        {
+            if (_categoryName.StartsWith("Microsoft.EntityFrameworkCore", StringComparison.OrdinalIgnoreCase) ||
+                _categoryName.StartsWith("Microsoft.AspNetCore", StringComparison.OrdinalIgnoreCase) ||
+                _categoryName.StartsWith("Microsoft.Extensions", StringComparison.OrdinalIgnoreCase) ||
+                _categoryName.StartsWith("System.Net", StringComparison.OrdinalIgnoreCase) ||
+                _categoryName.StartsWith("Avalonia", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     public void Log<TState>(
         LogLevel logLevel,
