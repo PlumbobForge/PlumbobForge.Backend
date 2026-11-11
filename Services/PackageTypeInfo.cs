@@ -19,17 +19,20 @@ public sealed record PackageTypeInfo(
 
     public void ApplyBuildBuyTo(MetaEntity meta)
     {
-        meta.BBKind = BBKind;
-        meta.BBRooms = BBRooms;
-        meta.BBFunctions = BBFunctions;
+        meta.BBKind = Pick(meta, meta.BBKind, BBKind);
+        meta.BBRooms = Pick(meta, meta.BBRooms, BBRooms);
+        meta.BBFunctions = Pick(meta, meta.BBFunctions, BBFunctions);
         meta.BBPriceMin = BBPriceMin;
         meta.BBPriceMax = BBPriceMax;
     }
 
     public bool BuildBuyEquals(MetaEntity meta) =>
-        meta.BBKind == BBKind &&
-        meta.BBRooms == BBRooms &&
-        meta.BBFunctions == BBFunctions &&
+        meta.BBKind == Pick(meta, meta.BBKind, BBKind) &&
+        meta.BBRooms == Pick(meta, meta.BBRooms, BBRooms) &&
+        meta.BBFunctions == Pick(meta, meta.BBFunctions, BBFunctions) &&
         meta.BBPriceMin == BBPriceMin &&
         meta.BBPriceMax == BBPriceMax;
+
+    private static string Pick(MetaEntity meta, string? current, string detected) =>
+        meta.IsUserTagged && !string.IsNullOrEmpty(current) ? current : detected;
 }
