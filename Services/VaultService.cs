@@ -18,6 +18,16 @@ namespace PlumbobForge.Backend.Services;
 
 public record VaultMigrationBatchResult(int MigratedCount, long BytesReclaimed, List<long> MigratedIds, List<string> Failures);
 
+/// <summary>
+/// Single-source vault: mods live as chunks inside per-set DBPF shards under Mods/PF_Vault/Set_{id}/.
+///
+/// The database is the source of truth; a shard's DBPF index is derived from it (enabled mods only).
+/// Every operation follows the same order so a crash never loses data:
+///   1. write new chunk bytes (appending never overwrites committed data),
+///   2. commit the database,
+///   3. rewrite the affected shard indexes from the database,
+///   4. only then punch holes over chunks nothing references any more.
+/// </summary>
 public class VaultService
 {
     private static readonly ILog log = LogManager.GetLogger(nameof(VaultService));
@@ -41,8 +51,10 @@ public class VaultService
     private readonly Sims3HiderService _hiderService;
     private PlumbobForgeOptions Options => _optionsMonitor.CurrentValue;
 
+    /// <summary>Profile of the configured texture settings, whether or not optimisation is switched on.</summary>
     private int ConfiguredTextureProfile => TextureOptimizer.GetProfile(Options.TextureMaxDimension);
 
+    /// <summary>Profile whose optimised copies the game should see, or 0 when optimisation is off.</summary>
     private int ActiveTextureProfile => Options.OptimizeTextures ? ConfiguredTextureProfile : 0;
 
     public VaultService(
@@ -82,8 +94,10 @@ public class VaultService
         return vaultDir;
     }
 
+    /// <summary>Folder of a set's shards. Keyed by set Id so it is unique and never changes on rename.</summary>
     public static string GetSetFolderName(long setId) => $"Set_{setId}";
 
+    /// <summary>Folder name used before shards were keyed by set Id (derived from the set's name).</summary>
     public static string GetLegacySetFolderName(SetsEntity? set)
     {
         string folderSlug = set != null && !string.IsNullOrWhiteSpace(set.FolderName)
@@ -105,6 +119,7 @@ public class VaultService
     private static bool IsLegacyRelativePath(string relativePath) =>
         relativePath.IndexOf('/') < 0 && relativePath.IndexOf('\\') < 0;
 
+    /// <summary>Resolves a shard's file path without a database or service instance (used by the cache builder).</summary>
     public static string ResolveShardPath(string vaultRootDir, VaultShardEntity shard, SetsEntity? set)
     {
         if (IsLegacyRelativePath(shard.RelativePath))
@@ -116,6 +131,7 @@ public class VaultService
 
     public string GetShardDirectory(SetsEntity set) => Path.Combine(GetVaultRootDirectory(), GetSetFolderName(set.Id));
 
+    /// <summary>Full path of a shard. Always resolved against the shard's own set.</summary>
     public string GetShardFullPath(VaultShardEntity shard)
     {
         var set = shard.SetsEntity;
@@ -130,19 +146,61 @@ public class VaultService
 
     #region Shared helpers
 
-    private async Task<List<VaultChunkEntry>> GetIndexedChunksAsync(long shardId)
+    /// <summary>
+    /// The index a shard should have: the chunks of enabled items the active configuration loads (see
+    /// <see cref="ConfigurationScope"/>). Also records on the tracked shard which rules this index follows.
+    /// </summary>
+    private async Task<List<VaultChunkEntry>> GetIndexedChunksAsync(long shardId, ConfigurationScope? scope = null)
     {
         int profile = ActiveTextureProfile;
+        scope ??= await ConfigurationScope.LoadActiveAsync(_db);
+        long shardSetId = await _db.VaultShards.Where(s => s.Id == shardId).Select(s => s.SetsEntityId).FirstOrDefaultAsync();
         var rows = await _db.VaultChunks
             .AsNoTracking()
             .Where(c => c.VaultShardId == shardId && c.MetaEntity!.Enabled)
-            .Select(c => new { Chunk = c, Skip = c.MetaEntity!.SkipTextureOptimization, ItemId = c.MetaEntity!.ParentMetaEntityId ?? c.MetaEntityId })
+            .Select(c => new { Chunk = c, Skip = c.MetaEntity!.SkipTextureOptimization, ItemId = c.MetaEntity!.ParentMetaEntityId ?? c.MetaEntityId, SetId = c.MetaEntity!.SetsEntityId })
             .ToListAsync();
         var disabled = await LoadDisabledObjectKeysAsync();
+
+        var tracked = _db.VaultShards.Local.FirstOrDefault(s => s.Id == shardId);
+        if (tracked != null) tracked.IndexScope = scope.GetShardIndexScope(shardSetId, rows.Select(r => r.ItemId));
+
         return rows
+            .Where(r => scope.Includes(r.ItemId, r.SetId ?? shardSetId))
             .Where(r => !disabled.Contains((r.ItemId, r.Chunk.Type, r.Chunk.Group, r.Chunk.Instance)))
             .Select(r => ToIndexEntry(r.Chunk, profile, r.Skip))
             .ToList();
+    }
+
+    private async Task<bool> IsLoadedByActiveConfigurationAsync(long? topLevelItemId, long setId)
+    {
+        var scope = await ConfigurationScope.LoadActiveAsync(_db);
+        return topLevelItemId.HasValue ? scope.Includes(topLevelItemId.Value, setId) : scope.SetIds.Contains(setId);
+    }
+
+    public async Task<int> ApplyActiveConfigurationToShardsAsync()
+    {
+        var scope = await ConfigurationScope.LoadActiveAsync(_db);
+        var shards = await _db.VaultShards.Include(s => s.SetsEntity).ToListAsync();
+        var itemsByShard = (await _db.VaultChunks.AsNoTracking()
+                .Where(c => c.MetaEntity!.Enabled)
+                .Select(c => new { c.VaultShardId, ItemId = c.MetaEntity!.ParentMetaEntityId ?? c.MetaEntityId })
+                .Distinct()
+                .ToListAsync())
+            .GroupBy(r => r.VaultShardId)
+            .ToDictionary(g => g.Key, g => g.Select(r => r.ItemId).ToList());
+
+        var changed = new List<long>();
+        foreach (var shard in shards)
+        {
+            string expected = scope.GetShardIndexScope(shard.SetsEntityId, itemsByShard.GetValueOrDefault(shard.Id) ?? new List<long>());
+            if (ConfigurationScope.ShardIndexMatches(shard.IndexScope, expected)) continue;
+            changed.Add(shard.Id);
+        }
+        if (changed.Count == 0) return 0;
+
+        await SyncAndReleaseAsync(new Dictionary<long, List<(long, int)>>(), changed);
+        return changed.Count;
     }
 
     private async Task<HashSet<(long ItemId, uint Type, uint Group, ulong Instance)>> LoadDisabledObjectKeysAsync()
@@ -432,6 +490,8 @@ public class VaultService
 
         string fullPath = Path.Combine(shardDir, shardFileName);
         DBPFVaultShard.EnsureShardCreated(fullPath);
+        // A new set folder has to be listed in Resource.cfg for the game to load it.
+        await _cacheBuilderService.RefreshVaultResourceCfgAsync();
         return (targetShard, fullPath);
     }
 
@@ -449,11 +509,13 @@ public class VaultService
 
         List<RawChunkPayload> rawChunks;
         PackageTypeInfo typeInfo;
+        // A set outside the active configuration can still have a shard the game reads (for items it includes).
+        bool indexed = await IsLoadedByActiveConfigurationAsync(null, targetSet.Id);
 
         using (var sourcePkg = new DBPFPackage(packageFilePath))
         {
             typeInfo = _packageTypeService.DetectPackageType(packageFilePath, false);
-            rawChunks = ReadPackagePayloads(sourcePkg, 0, indexed: true);
+            rawChunks = ReadPackagePayloads(sourcePkg, 0, indexed);
         }
 
         var (shard, shardFullPath) = await GetOrCreateTargetShardAsync(targetSet, EstimateBytes(rawChunks));
@@ -488,7 +550,7 @@ public class VaultService
 
         _db.VaultChunks.AddRange(ToChunkEntities(appendedEntries, meta.Id, shard.Id));
         shard.FileSize = new FileInfo(shardFullPath).Length;
-        shard.ResourceCount = existingIndexed.Count + appendedEntries.Count;
+        shard.ResourceCount = existingIndexed.Count + (indexed ? appendedEntries.Count : 0);
         await _db.SaveChangesAsync();
 
         await OptimizeNewModsAsync(new[] { meta.Id });
@@ -588,6 +650,7 @@ public class VaultService
         await _db.SaveChangesAsync();
 
         bool enabled = parentMeta.Enabled;
+        bool indexed = enabled && await IsLoadedByActiveConfigurationAsync(parentMeta.Id, targetSet.Id);
         int subPackageIndex = 0;
         var childIds = new List<long>();
         foreach (var subPkg in s3p.Packages)
@@ -610,7 +673,7 @@ public class VaultService
             }
 
             // Normal CC subpackage -> stream directly to shard
-            var rawChunks = ReadPackagePayloads(subPkg, 0, enabled);
+            var rawChunks = ReadPackagePayloads(subPkg, 0, indexed);
             long totalChunkSize = rawChunks.Sum(c => (long)c.ChunkLength);
             var (shard, shardFullPath) = await GetOrCreateTargetShardAsync(targetSet, EstimateBytes(rawChunks));
 
@@ -638,7 +701,7 @@ public class VaultService
 
             _db.VaultChunks.AddRange(ToChunkEntities(appended, childMeta.Id, shard.Id));
             shard.FileSize = new FileInfo(shardFullPath).Length;
-            shard.ResourceCount = existingIndexed.Count + (enabled ? appended.Count : 0);
+            shard.ResourceCount = existingIndexed.Count + (indexed ? appended.Count : 0);
             if (string.IsNullOrEmpty(parentMeta.CompleteFileName) || parentMeta.CompleteFileName == sims3PackPath)
             {
                 parentMeta.CompleteFileName = shardFullPath;
@@ -807,12 +870,13 @@ public class VaultService
                 .Concat(withCopies.Select(c => (c.OptimizedOffset, c.OptimizedLength)))
                 .ToList();
             var raws = DBPFVaultShard.ReadRawChunks(sourceFullPath, reads);
+            bool indexed = meta.Enabled && await IsLoadedByActiveConfigurationAsync(meta.ParentMetaEntityId ?? meta.Id, targetSet.Id);
             var payloads = oldChunks.Select((c, i) => new RawChunkPayload(
                 new TGI_Key(c.Type, c.Group, c.Instance),
                 raws[i],
                 c.ResourceLength,
                 c.IsCompressed,
-                meta.Id) { Indexed = meta.Enabled }).ToList();
+                meta.Id) { Indexed = indexed }).ToList();
             payloads.AddRange(withCopies.Select((c, i) => new RawChunkPayload(
                 new TGI_Key(c.Type, c.Group, c.Instance),
                 raws[oldChunks.Count + i],
@@ -961,6 +1025,8 @@ public class VaultService
             }
         }
         catch { }
+
+        await _cacheBuilderService.RefreshVaultResourceCfgAsync();
     }
 
     #endregion
@@ -979,6 +1045,7 @@ public class VaultService
 
         int migratedCount = 0;
         long bytesReclaimed = 0;
+        var scope = await ConfigurationScope.LoadActiveAsync(_db);
         const long maxShardBytes = 950 * 1024 * 1024;
         const int batchPackageLimit = 40;
 
@@ -1037,9 +1104,10 @@ public class VaultService
                 try
                 {
                     List<RawChunkPayload> rawChunks;
+                    bool indexed = meta.Enabled && scope.Includes(meta);
                     using (var sourcePkg = new DBPFPackage(filePath))
                     {
-                        rawChunks = ReadPackagePayloads(sourcePkg, meta.Id, meta.Enabled);
+                        rawChunks = ReadPackagePayloads(sourcePkg, meta.Id, indexed);
                     }
 
                     long pkgBytes = rawChunks.Sum(c => (long)c.ChunkLength) + (rawChunks.Count * 32);
@@ -1078,7 +1146,7 @@ public class VaultService
             {
                 var entries = appended.Skip(cursor).Take(item.Chunks.Count).ToList();
                 cursor += item.Chunks.Count;
-                if (item.Meta.Enabled) indexedAppended += entries.Count;
+                if (item.Chunks.Count > 0 && item.Chunks[0].Indexed) indexedAppended += entries.Count;
 
                 _db.VaultChunks.AddRange(ToChunkEntities(entries, item.Meta.Id, shard.Id));
                 item.Meta.IsVaultManaged = true;
@@ -1239,6 +1307,7 @@ public class VaultService
         var librarySubItems = new List<(byte[] Data, string PackageType)>();
         PackageTypeInfo typeInfo;
         bool isSims3PackReplacement = replacementFilePath.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase);
+        bool replacementIndexed = meta.Enabled && await IsLoadedByActiveConfigurationAsync(meta.Id, targetSet.Id);
 
         try
         {
@@ -1259,7 +1328,7 @@ public class VaultService
                         librarySubItems.Add((ms.ToArray(), specialType));
                         continue;
                     }
-                    rawChunks.AddRange(ReadPackagePayloads(subPkg, meta.Id, meta.Enabled));
+                    rawChunks.AddRange(ReadPackagePayloads(subPkg, meta.Id, replacementIndexed));
                 }
                 typeInfo = new PackageTypeInfo("Sims3Pack");
             }
@@ -1272,7 +1341,7 @@ public class VaultService
                     log.Warn($"Not replacing vault mod {meta.FileName} with {replacementFilePath}: lots, Sims and worlds are never stored in the vault");
                     return false;
                 }
-                rawChunks = ReadPackagePayloads(sourcePkg, meta.Id, meta.Enabled);
+                rawChunks = ReadPackagePayloads(sourcePkg, meta.Id, replacementIndexed);
             }
         }
         catch (Exception ex)
@@ -1303,7 +1372,7 @@ public class VaultService
             var appendedEntries = DBPFVaultShard.AppendChunksAndCommit(targetFullPath, rawChunks, targetIndexed);
             _db.VaultChunks.AddRange(ToChunkEntities(appendedEntries, meta.Id, targetShard.Id));
             targetShard.FileSize = new FileInfo(targetFullPath).Length;
-            targetShard.ResourceCount = targetIndexed.Count + (meta.Enabled ? appendedEntries.Count : 0);
+            targetShard.ResourceCount = targetIndexed.Count + (rawChunks[0].Indexed ? appendedEntries.Count : 0);
         }
 
         // 3. Commit the new mapping
@@ -1405,10 +1474,11 @@ public class VaultService
         var replacedIds = replacedChunks.Select(c => c.Id).ToHashSet();
 
         // 1. Append the new contents (thumbnails are small PNGs, stored uncompressed like the game's own).
+        bool isIndexed = meta.Enabled && await IsLoadedByActiveConfigurationAsync(meta.ParentMetaEntityId ?? meta.Id, meta.SetsEntityId ?? shard.SetsEntityId);
         var payloads = edits
             .Where(e => e.NewData != null)
             .GroupBy(e => e.Key).Select(g => g.Last())
-            .Select(e => new RawChunkPayload(e.Key, e.NewData!, e.NewData!.Length, false, meta.Id) { Indexed = meta.Enabled })
+            .Select(e => new RawChunkPayload(e.Key, e.NewData!, e.NewData!.Length, false, meta.Id) { Indexed = isIndexed })
             .ToList();
         var appended = new List<VaultChunkEntry>();
         if (payloads.Count > 0)
@@ -1722,7 +1792,13 @@ public class VaultService
             .Where(c => c.VaultShardId == shard.Id)
             .ToListAsync();
 
-        var enabledMetaIds = chunks.Where(c => c.MetaEntity?.Enabled == true).Select(c => c.MetaEntityId).ToHashSet();
+        var scope = await ConfigurationScope.LoadActiveAsync(_db);
+        var enabledMetaIds = chunks
+            .Where(c => c.MetaEntity?.Enabled == true && scope.Includes(ConfigurationScope.TopLevelId(c.MetaEntity), c.MetaEntity.SetsEntityId ?? shard.SetsEntityId))
+            .Select(c => c.MetaEntityId)
+            .ToHashSet();
+        shard.IndexScope = scope.GetShardIndexScope(shard.SetsEntityId,
+            chunks.Where(c => c.MetaEntity?.Enabled == true).Select(c => ConfigurationScope.TopLevelId(c.MetaEntity!)));
         var disabledObjects = await LoadDisabledObjectKeysAsync();
         var turnedOffChunkIds = chunks
             .Where(c => disabledObjects.Contains((c.MetaEntity?.ParentMetaEntityId ?? c.MetaEntityId, c.Type, c.Group, c.Instance)))
