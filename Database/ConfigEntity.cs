@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 
 namespace PlumbobForge.Backend.Database;
@@ -15,4 +15,5 @@ public class ConfigEntity
 
     public ICollection<ConfigSetsEntity> ConfigSetsEntities { get; set; } = new List<ConfigSetsEntity>();
     public ICollection<SettingEntity> SettingEntities { get; set; } = new List<SettingEntity>();
+    public ICollection<ConfigItemOverrideEntity> ItemOverrides { get; set; } = new List<ConfigItemOverrideEntity>();
 }

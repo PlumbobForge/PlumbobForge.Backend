@@ -34,6 +34,7 @@ public class MetaEntity
     public bool SkipTextureOptimization { get; set; } = false;
     public int DisabledObjectCount { get; set; }
     public string? DisabledObjectsStamp { get; set; }
+    public bool HasConfigOverrides { get; set; }
 
     public long? SetsEntityId { get; set; }
     public SetsEntity? SetsEntity { get; set; }

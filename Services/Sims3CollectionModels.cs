@@ -17,6 +17,7 @@ public class CollectionModel
     public int ItemCount { get; set; }
     public List<long> LinkedSetIds { get; set; } = new();
     public List<string> LinkedSetNames { get; set; } = new();
+    public List<long> LinkedItemIds { get; set; } = new();
     public Dictionary<TGI_Key, uint> Items { get; set; } = new();
     public byte[]? IconBytes { get; set; }
     public bool IsPlumbobForge { get; set; } = false;

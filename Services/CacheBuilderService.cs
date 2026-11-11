@@ -79,14 +79,16 @@ public class CacheBuilderService
     private readonly IOptionsMonitor<PlumbobForgeOptions> _optionsMonitor;
     private PlumbobForgeOptions _options => _optionsMonitor.CurrentValue;
     private readonly LocalizationService _localizer;
+    private readonly IServiceProvider? _services;
 
     private string? _cachedSims3FolderPath;
 
-    public CacheBuilderService(AppDbContext db, IOptionsMonitor<PlumbobForgeOptions> options, LocalizationService localizer)
+    public CacheBuilderService(AppDbContext db, IOptionsMonitor<PlumbobForgeOptions> options, LocalizationService localizer, IServiceProvider? services = null)
     {
         _db = db;
         _optionsMonitor = options;
         _localizer = localizer;
+        _services = services;
     }
 
     public string GetSims3FolderPath()
@@ -124,8 +126,15 @@ public class CacheBuilderService
             bool vaultMode = _options.EnableSingleSourceVault;
             bool isStatic = !vaultMode && string.Equals(_options.CacheMethod, "Static", StringComparison.OrdinalIgnoreCase);
             bool resourceCfgChanged = false;
+            var scope = await ConfigurationScope.LoadActiveAsync(_db);
             if (vaultMode)
             {
+                // Shard indexes follow the configuration's single-item includes and excludes.
+                if (_services?.GetService(typeof(VaultService)) is VaultService vault)
+                {
+                    try { await vault.ApplyActiveConfigurationToShardsAsync(); }
+                    catch (Exception ex) { onProgress?.Invoke($"Could not update vault indexes for the configuration: {ex.Message}"); }
+                }
                 resourceCfgChanged = await WriteVaultResourceCfgAsync(sims3ConfigDir, activeConfig);
             }
             else if (isStatic)
@@ -167,6 +176,17 @@ public class CacheBuilderService
                     .Select(GetSetFolderName)
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
                 allSetFolderNames.Add("Config");
+                allSetFolderNames.Add(ConfigItemsFolderName);
+
+                // Items the configuration includes or excludes on their own live in their own small cache.
+                try
+                {
+                    await BuildConfigItemsCacheIfStaleAsync(scope, onProgress);
+                }
+                catch (Exception ex)
+                {
+                    onProgress?.Invoke($"Could not build the configuration item cache: {ex.Message}");
+                }
 
                 foreach (var dir in Directory.GetDirectories(sims3CacheDir))
                 {
@@ -183,7 +203,7 @@ public class CacheBuilderService
             if (vaultMode)
             {
                 // Lots and Sims stay library files in vault mode; deploy those of the active configuration directly.
-                foreach (var (dest, source) in await GetVaultModeLibraryDeploymentsAsync(activeConfig))
+                foreach (var (dest, source) in await GetVaultModeLibraryDeploymentsAsync(scope))
                 {
                     targetFilesToSync[dest] = source;
                 }
@@ -205,6 +225,13 @@ public class CacheBuilderService
 
                         AddNonPackageTargets(Path.Combine(GetSetPath(cs.SetsEntity), "NonPackageItems.txt"), targetFilesToSync);
                     }
+                }
+                string configItemsPath = GetSetCachePath(ConfigItemsFolderName);
+                if (Directory.Exists(configItemsPath))
+                {
+                    cfg.AppendLine($"PackedFile \"../{ConfigItemsFolderName}/*.package\"");
+                    cfg.AppendLine($"PackedFile \"../{ConfigItemsFolderName}/*/*.package\"");
+                    AddNonPackageTargets(Path.Combine(configItemsPath, "NonPackageItems.txt"), targetFilesToSync);
                 }
                 resourceCfgChanged = WriteResourceCfgIfChanged(configResourceCfg, cfg.ToString());
             }
@@ -286,8 +313,6 @@ public class CacheBuilderService
                     .Where(m => m.PackageType == "World" || m.FileType == "WORLD" || m.FileName.EndsWith(".world"))
                     .ToListAsync();
 
-                var activeSetIds = activeConfig?.ConfigSetsEntities.Select(cs => cs.SetsEntityId).ToHashSet() ?? new HashSet<long>();
-
                 string managedWorldsFile = Path.Combine(_options.DocumentBaseDir, "ManagedWorlds.txt");
                 var previouslyManaged = File.Exists(managedWorldsFile)
                     ? File.ReadAllLines(managedWorldsFile).Where(l => !string.IsNullOrWhiteSpace(l)).ToHashSet(StringComparer.OrdinalIgnoreCase)
@@ -310,7 +335,7 @@ public class CacheBuilderService
 
                     currentManaged.Add(worldBaseName);
 
-                    bool isWorldEnabled = worldItem.Enabled && (worldItem.SetsEntityId.HasValue && activeSetIds.Contains(worldItem.SetsEntityId.Value));
+                    bool isWorldEnabled = scope.IsLoaded(worldItem);
                     string enabledPath = Path.Combine(gameWorldsDir, $"{worldBaseName}.world");
                     string disabledPath = Path.Combine(gameWorldsDir, $"{worldBaseName}.world.disabled");
 
@@ -400,19 +425,18 @@ public class CacheBuilderService
     }
 
     private async Task<List<(string Dest, string Source)>> GetVaultModeLibraryDeploymentsAsync(ConfigEntity? activeConfig)
+    private async Task<List<(string Dest, string Source)>> GetVaultModeLibraryDeploymentsAsync(ConfigurationScope scope)
     {
         var result = new List<(string, string)>();
-        var activeSetIds = activeConfig?.ConfigSetsEntities.Select(cs => cs.SetsEntityId).ToList() ?? new List<long>();
-        if (activeSetIds.Count == 0) return result;
-
         var items = await _db.MetaEntities
             .AsNoTracking()
-            .Where(m => !m.IsVaultManaged && m.Enabled && m.SetsEntityId.HasValue && activeSetIds.Contains(m.SetsEntityId.Value))
+            .Where(m => !m.IsVaultManaged && m.Enabled)
             .ToListAsync();
 
         string sims3Dir = GetSims3FolderPath();
         foreach (var item in items)
         {
+            if (!scope.Includes(item)) continue;
             bool isSim = string.Equals(item.PackageType, PackageTypeHelper.Sim, StringComparison.OrdinalIgnoreCase) || item.FileType == "SIM";
             bool isLot = !isSim && string.Equals(item.PackageType, PackageTypeHelper.Lot, StringComparison.OrdinalIgnoreCase);
             if (!isSim && !isLot) continue;
@@ -445,12 +469,43 @@ public class CacheBuilderService
         return true;
     }
 
+    public async Task RefreshVaultResourceCfgAsync()
+    {
+        if (!_options.EnableSingleSourceVault) return;
+        try
+        {
+            string sims3ModsDir = Path.Combine(GetSims3FolderPath(), "Mods");
+            string sims3ConfigDir = Path.Combine(sims3ModsDir, "Cache", "Config");
+            Directory.CreateDirectory(sims3ConfigDir);
+            EnsureMainResourceCfg(sims3ModsDir);
+
+            var activeConfig = await _db.ConfigEntities
+                .Include(c => c.ConfigSetsEntities)
+                .FirstOrDefaultAsync(c => c.Active);
+            await WriteVaultResourceCfgAsync(sims3ConfigDir, activeConfig);
+        }
+        catch
+        {
+            // The next full sync rewrites it.
+        }
+    }
+
     private async Task<bool> WriteVaultResourceCfgAsync(string sims3ConfigDir, ConfigEntity? activeConfig)
     {
         var activeSetIds = activeConfig?.ConfigSetsEntities.Select(cs => cs.SetsEntityId).ToList() ?? new List<long>();
+        var includedIds = activeConfig == null
+            ? new List<long>()
+            : await _db.ConfigItemOverrides.Where(o => o.ConfigEntityId == activeConfig.Id && o.Include).Select(o => o.MetaEntityId).ToListAsync();
+        var extraShardIds = includedIds.Count == 0
+            ? new List<long>()
+            : await _db.VaultChunks
+                .Where(c => c.MetaEntity!.Enabled && includedIds.Contains(c.MetaEntity!.ParentMetaEntityId ?? c.MetaEntityId))
+                .Select(c => c.VaultShardId)
+                .Distinct()
+                .ToListAsync();
         var shards = await _db.VaultShards
             .Include(s => s.SetsEntity)
-            .Where(s => activeSetIds.Contains(s.SetsEntityId))
+            .Where(s => activeSetIds.Contains(s.SetsEntityId) || extraShardIds.Contains(s.Id))
             .ToListAsync();
 
         string vaultRoot = VaultService.GetVaultRootDirectory(GetSims3FolderPath());
@@ -630,9 +685,20 @@ public class CacheBuilderService
 
         await _db.SaveChangesAsync();
 
-        if (total > 0)
+        bool configItemsChanged = false;
+        try
         {
-            PruneStagedNonPackageFiles(allSets.Select(s => Path.Combine(GetSetPath(s), "NonPackageItems.txt")));
+            configItemsChanged = await BuildConfigItemsCacheIfStaleAsync(onProgress: onProgress, force: forceRebuild);
+        }
+        catch (Exception ex)
+        {
+            onProgress?.Invoke($"Error rebuilding the configuration item cache: {ex.Message}");
+        }
+
+        if (total > 0 || configItemsChanged)
+        {
+            PruneStagedNonPackageFiles(allSets.Select(s => Path.Combine(GetSetPath(s), "NonPackageItems.txt"))
+                .Append(Path.Combine(GetSetCachePath(ConfigItemsFolderName), "NonPackageItems.txt")));
             OnGameContentChanged();
             PruneTextureCache();
         }
@@ -743,9 +809,16 @@ public class CacheBuilderService
 
         // Sort items by PackageType category so that CAS items, BuildBuy items, etc., are clustered into contiguous bundles.
         // One entry per item: different mods may share a file name (in different library sub-folders).
+        var scope = activeConfig == null
+            ? new ConfigurationScope(activeSets.Select(s => s.Id).ToHashSet(), new Dictionary<long, bool>())
+            : await ConfigurationScope.LoadAsync(_db, activeConfig.Id, activeSets.Select(s => s.Id));
+        var includedElsewhere = scope.Overrides.Any(o => o.Value)
+            ? await _db.MetaEntities.Where(m => m.HasConfigOverrides && m.Enabled).ToListAsync()
+            : new List<MetaEntity>();
         var allMetaItems = activeSets
             .SelectMany(s => s.MetaEntities ?? new List<MetaEntity>())
-            .Where(m => m.Enabled)
+            .Concat(includedElsewhere)
+            .Where(scope.IsLoaded)
             .GroupBy(m => m.Id)
             .Select(g => g.First())
             .OrderBy(m => GetPackageTypePriority(m.PackageType))
@@ -904,7 +977,7 @@ public class CacheBuilderService
         string setPath = GetSetPath(activeSet);
         Directory.CreateDirectory(setPath);
 
-        var metaEntities = (activeSet.MetaEntities?.Where(m => m.Enabled) ?? Enumerable.Empty<MetaEntity>())
+        var metaEntities = (activeSet.MetaEntities?.Where(m => m.Enabled && !m.HasConfigOverrides) ?? Enumerable.Empty<MetaEntity>())
             .OrderBy(m => GetPackageTypePriority(m.PackageType))
             .ThenBy(m => m.PackageType)
             .ThenBy(m => m.FileName)
@@ -942,6 +1015,70 @@ public class CacheBuilderService
 
         activeSet.CachedHash = SetDirtyTracker.ComputeContentHash(activeSet);
         activeSet.Dirty = false;
+    }
+
+    public const string ConfigItemsFolderName = "ConfigItems";
+
+    private const string ConfigItemsHashFile = "BuildHash.txt";
+
+    private async Task<List<MetaEntity>> GetConfigItemsAsync(ConfigurationScope scope)
+    {
+        var candidates = await _db.MetaEntities
+            .Where(m => m.HasConfigOverrides && m.Enabled)
+            .ToListAsync();
+        return candidates
+            .Where(scope.Includes)
+            .OrderBy(m => GetPackageTypePriority(m.PackageType))
+            .ThenBy(m => m.PackageType)
+            .ThenBy(m => m.FileName)
+            .ThenBy(m => m.Id)
+            .ToList();
+    }
+
+    public async Task<bool> BuildConfigItemsCacheIfStaleAsync(ConfigurationScope? scope = null, Action<string>? onProgress = null, bool force = false)
+    {
+        if (_options.EnableSingleSourceVault || string.Equals(_options.CacheMethod, "Static", StringComparison.OrdinalIgnoreCase)) return false;
+
+        scope ??= await ConfigurationScope.LoadActiveAsync(_db);
+        var items = await GetConfigItemsAsync(scope);
+        string path = GetSetCachePath(ConfigItemsFolderName);
+
+        if (items.Count == 0)
+        {
+            if (!Directory.Exists(path)) return false;
+            Sims3GameProcess.ThrowIfGameRunning(_localizer.GetString("progress.game_running_rebuild"));
+            Directory.Delete(path, true);
+            OnGameContentChanged();
+            return true;
+        }
+
+        string hash = SetDirtyTracker.ComputeContentHash(ConfigItemsFolderName, items);
+        string hashFile = Path.Combine(path, ConfigItemsHashFile);
+        if (!force && File.Exists(hashFile) && string.Equals(File.ReadAllText(hashFile).Trim(), hash, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        Sims3GameProcess.ThrowIfGameRunning(_localizer.GetString("progress.game_running_rebuild"));
+        onProgress?.Invoke(_localizer.GetString("rebuilding_cache_for_set", ConfigItemsFolderName, 1, 1));
+        await LoadDisabledObjectsAsync();
+
+        Directory.CreateDirectory(path);
+        try { File.Delete(hashFile); } catch { }
+
+        var ctx = new MergeContext(path, "ModBUILD", CreateTextureCache(), null, onProgress) { DisabledObjects = _disabledObjects };
+        DeleteStaleNewFiles(ctx);
+        MergeItems(items, ctx, parallel: items.Count > 10, _ => { });
+        foreach (var (entity, fallback) in ctx.FallbackUpdates)
+        {
+            entity.CompleteFileName = fallback;
+        }
+        FinalizeOutput(ctx);
+        await _db.SaveChangesAsync();
+
+        File.WriteAllText(hashFile, hash);
+        OnGameContentChanged();
+        return true;
     }
 
     private sealed class MergeContext

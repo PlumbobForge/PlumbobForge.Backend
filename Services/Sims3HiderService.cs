@@ -88,16 +88,25 @@ public class Sims3HiderService
         var collections = await _db.Collections
             .AsNoTracking()
             .Include(c => c.CollectionSets)
+            .Include(c => c.CollectionItems)
             .Where(c => c.HideFromCatalog)
             .ToListAsync(cancellationToken);
 
         foreach (var collection in collections)
         {
             var includedSetIds = collection.CollectionSets.Select(cs => cs.SetsEntityId).ToList();
+            var includedItemIds = collection.CollectionItems.Select(ci => ci.MetaEntityId).ToList();
             var allSetIds = await SetHierarchyHelper.GetAllDescendantSetIdsAsync(_db, includedSetIds, cancellationToken);
-            if (!allSetIds.Any(changedSetIds.Contains)) continue;
+            bool affected = allSetIds.Any(changedSetIds.Contains);
+            if (!affected && includedItemIds.Count > 0)
+            {
+                // An item included on its own sits in one of the changed sets.
+                affected = await _db.MetaEntities.AsNoTracking()
+                    .AnyAsync(m => includedItemIds.Contains(m.Id) && m.SetsEntityId.HasValue && changedSetIds.Contains(m.SetsEntityId.Value), cancellationToken);
+            }
+            if (!affected) continue;
 
-            await GenerateHiderPackageAsync(collection.Id, collection.Name, includedSetIds, cancellationToken);
+            await GenerateHiderPackageAsync(collection.Id, collection.Name, includedSetIds, cancellationToken, includedItemIds);
         }
     }
 
@@ -105,7 +114,8 @@ public class Sims3HiderService
         ulong collectionId,
         string collectionName,
         IEnumerable<long> includedSetIds,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IEnumerable<long>? includedItemIds = null)
     {
         var result = new HiderGenerationResult { CollectionId = collectionId };
 
@@ -127,13 +137,10 @@ public class Sims3HiderService
         result.FilePath = targetPath;
 
         var setIdsList = includedSetIds?.Distinct().ToList() ?? new List<long>();
-        var allSelectedSetIds = await SetHierarchyHelper.GetAllDescendantSetIdsAsync(_db, setIdsList, cancellationToken);
 
-        // Query enabled items from selected sets (a disabled mod's objects are not in the game to hide)
-        var metaItems = await _db.MetaEntities
-            .AsNoTracking()
-            .Where(m => m.Enabled && m.SetsEntityId.HasValue && allSelectedSetIds.Contains(m.SetsEntityId.Value))
-            .ToListAsync(cancellationToken);
+        // Enabled items of the selected sets and the items included on their own
+        // (a disabled mod's objects are not in the game to hide)
+        var metaItems = await Sims3CollectionService.GetCollectionMetaItemsAsync(_db, setIdsList, includedItemIds, buildBuyOnly: false, cancellationToken);
 
         var modifiedObjds = new Dictionary<TGI_Key, byte[]>();
         var objectGuids = new HashSet<ulong>();

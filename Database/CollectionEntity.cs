@@ -31,4 +31,6 @@ public class CollectionEntity
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 
     public virtual ICollection<CollectionSetsEntity> CollectionSets { get; set; } = new List<CollectionSetsEntity>();
+
+    public virtual ICollection<CollectionItemsEntity> CollectionItems { get; set; } = new List<CollectionItemsEntity>();
 }

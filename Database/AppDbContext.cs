@@ -12,10 +12,12 @@ public class AppDbContext : DbContext
     public DbSet<TombstoneEntity> Tombstones { get; set; }
     public DbSet<CollectionEntity> Collections { get; set; }
     public DbSet<CollectionSetsEntity> CollectionSets { get; set; }
+    public DbSet<CollectionItemsEntity> CollectionItems { get; set; }
     public DbSet<VaultShardEntity> VaultShards { get; set; }
     public DbSet<VaultChunkEntity> VaultChunks { get; set; }
     public DbSet<VaultHoleEntity> VaultHoles { get; set; }
     public DbSet<DisabledObjectEntity> DisabledObjects { get; set; }
+    public DbSet<ConfigItemOverrideEntity> ConfigItemOverrides { get; set; }
 
     public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
 
@@ -84,6 +86,18 @@ public class AppDbContext : DbContext
             .HasOne(cs => cs.Set)
             .WithMany()
             .HasForeignKey(cs => cs.SetsEntityId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<CollectionItemsEntity>()
+            .HasOne(ci => ci.Collection)
+            .WithMany(c => c.CollectionItems)
+            .HasForeignKey(ci => ci.CollectionEntityId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<CollectionItemsEntity>()
+            .HasOne(ci => ci.Item)
+            .WithMany()
+            .HasForeignKey(ci => ci.MetaEntityId)
             .OnDelete(DeleteBehavior.Cascade);
 
         modelBuilder.Entity<SettingEntity>()
@@ -158,5 +172,24 @@ public class AppDbContext : DbContext
 
         modelBuilder.Entity<DisabledObjectEntity>()
             .HasIndex(d => d.MetaEntityId);
+
+        modelBuilder.Entity<ConfigItemOverrideEntity>()
+            .HasOne(o => o.ConfigEntity)
+            .WithMany(c => c.ItemOverrides)
+            .HasForeignKey(o => o.ConfigEntityId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<ConfigItemOverrideEntity>()
+            .HasOne(o => o.MetaEntity)
+            .WithMany()
+            .HasForeignKey(o => o.MetaEntityId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<ConfigItemOverrideEntity>()
+            .HasIndex(o => new { o.ConfigEntityId, o.MetaEntityId })
+            .IsUnique();
+
+        modelBuilder.Entity<ConfigItemOverrideEntity>()
+            .HasIndex(o => o.MetaEntityId);
     }
 }

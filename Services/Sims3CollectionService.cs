@@ -218,15 +218,28 @@ public class Sims3CollectionService
     {
         var dbCollMap = new Dictionary<ulong, CollectionEntity>();
         var setBuildBuyCounts = new Dictionary<long, int>();
+        // Items included on their own that count toward a collection (enabled Build/Buy), with their set.
+        var countedItems = new Dictionary<long, long?>();
         try
         {
             await EnsureDatabaseTablesAsync(cancellationToken);
             var dbCollections = await _db.Collections
                 .Include(c => c.CollectionSets)
                 .ThenInclude(cs => cs.Set)
+                .Include(c => c.CollectionItems)
                 .AsNoTracking()
                 .ToListAsync(cancellationToken);
             dbCollMap = dbCollections.ToDictionary(c => c.Id, c => c);
+
+            var includedIds = dbCollections.SelectMany(c => c.CollectionItems.Select(ci => ci.MetaEntityId)).Distinct().ToList();
+            if (includedIds.Count > 0)
+            {
+                countedItems = (await _db.MetaEntities.AsNoTracking()
+                        .Where(m => includedIds.Contains(m.Id) && m.Enabled && PackageTypeHelper.BuildBuyTypes.Contains(m.PackageType))
+                        .Select(m => new { m.Id, m.SetsEntityId })
+                        .ToListAsync(cancellationToken))
+                    .ToDictionary(m => m.Id, m => m.SetsEntityId);
+            }
 
             var rawCounts = await _db.SetsEntities
                 .AsNoTracking()
@@ -318,6 +331,7 @@ public class Sims3CollectionService
                     bool hideFromCatalog = false;
                     var linkedSetIds = new List<long>();
                     var linkedSetNames = new List<string>();
+                    var linkedItemIds = new List<long>();
 
                     if (dbCollMap.TryGetValue(collectionId, out var dbColl))
                     {
@@ -325,12 +339,14 @@ public class Sims3CollectionService
                         hideFromCatalog = dbColl.HideFromCatalog;
                         linkedSetIds = dbColl.CollectionSets.Select(cs => cs.SetsEntityId).ToList();
                         linkedSetNames = dbColl.CollectionSets.Where(cs => cs.Set != null).Select(cs => cs.Set!.Name).ToList();
+                        linkedItemIds = dbColl.CollectionItems.Select(ci => ci.MetaEntityId).ToList();
                     }
 
                     int displayItemCount = items.Count;
-                    if (isPlumbobForge && linkedSetIds.Count > 0)
+                    if (isPlumbobForge && (linkedSetIds.Count > 0 || linkedItemIds.Count > 0))
                     {
-                        displayItemCount = linkedSetIds.Sum(id => setBuildBuyCounts.TryGetValue(id, out var count) ? count : 0);
+                        displayItemCount = linkedSetIds.Sum(id => setBuildBuyCounts.TryGetValue(id, out var count) ? count : 0)
+                            + linkedItemIds.Count(id => countedItems.TryGetValue(id, out var setId) && !(setId.HasValue && linkedSetIds.Contains(setId.Value)));
                     }
 
                     collections.Add(new CollectionModel
@@ -350,6 +366,7 @@ public class Sims3CollectionService
                         HideFromCatalog = hideFromCatalog,
                         LinkedSetIds = linkedSetIds,
                         LinkedSetNames = linkedSetNames,
+                        LinkedItemIds = linkedItemIds,
                         LastModified = fi.LastWriteTime
                     });
                 }
@@ -443,9 +460,34 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
     FOREIGN KEY (SetsEntityId) REFERENCES SetsEntities(Id) ON DELETE CASCADE
 );", cancellationToken);
             try { await _db.Database.ExecuteSqlRawAsync("ALTER TABLE Collections ADD COLUMN HideFromCatalog INTEGER NOT NULL DEFAULT 0;", cancellationToken); } catch { }
+            await _db.Database.ExecuteSqlRawAsync(CreateCollectionItemsTableSql, cancellationToken);
             _tablesEnsured = true;
         }
         catch { }
+    }
+
+    public const string CreateCollectionItemsTableSql = @"
+CREATE TABLE IF NOT EXISTS CollectionItems (
+    Id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    CollectionEntityId INTEGER NOT NULL,
+    MetaEntityId INTEGER NOT NULL,
+    FOREIGN KEY (CollectionEntityId) REFERENCES Collections(Id) ON DELETE CASCADE,
+    FOREIGN KEY (MetaEntityId) REFERENCES MetaEntities(Id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS IX_CollectionItems_CollectionEntityId ON CollectionItems (CollectionEntityId);
+CREATE INDEX IF NOT EXISTS IX_CollectionItems_MetaEntityId ON CollectionItems (MetaEntityId);";
+
+    internal static async Task<List<MetaEntity>> GetCollectionMetaItemsAsync(AppDbContext db, IEnumerable<long> setIds, IEnumerable<long>? itemIds, bool buildBuyOnly, CancellationToken cancellationToken)
+    {
+        var allSetIds = await SetHierarchyHelper.GetAllDescendantSetIdsAsync(db, setIds.Distinct().ToList(), cancellationToken);
+        var ids = (itemIds ?? Enumerable.Empty<long>()).Distinct().ToList();
+        var query = db.MetaEntities.AsNoTracking()
+            .Where(m => m.Enabled && (
+                (m.SetsEntityId.HasValue && allSetIds.Contains(m.SetsEntityId.Value)) ||
+                ids.Contains(m.Id) ||
+                (m.ParentMetaEntityId.HasValue && ids.Contains(m.ParentMetaEntityId.Value))));
+        if (buildBuyOnly) query = query.Where(m => PackageTypeHelper.BuildBuyTypes.Contains(m.PackageType));
+        return await query.ToListAsync(cancellationToken);
     }
 
     public async Task<CollectionSaveResult> SaveCollectionAsync(
@@ -454,7 +496,8 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
         TGI_Key iconKey,
         IEnumerable<long> includedSetIds,
         bool hideFromCatalog = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IEnumerable<long>? includedItemIds = null)
     {
         await EnsureDatabaseTablesAsync(cancellationToken);
         var result = new CollectionSaveResult();
@@ -487,14 +530,12 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
         string targetPath = Path.Combine(folder, fileName);
 
         var setIdsList = includedSetIds?.Distinct().ToList() ?? new List<long>();
-        var allSelectedSetIds = await SetHierarchyHelper.GetAllDescendantSetIdsAsync(_db, setIdsList, cancellationToken);
+        var itemIdsList = includedItemIds?.Distinct().ToList() ?? new List<long>();
 
-        // Query items from selected sets (only build/buy items needed)
-        var metaItems = await _db.MetaEntities
-            .AsNoTracking()
-            .Where(m => m.SetsEntityId.HasValue && allSelectedSetIds.Contains(m.SetsEntityId.Value) && m.Enabled && PackageTypeHelper.BuildBuyTypes.Contains(m.PackageType))
+        // Items of the selected sets plus the items included on their own (only build/buy items needed)
+        var metaItems = (await GetCollectionMetaItemsAsync(_db, setIdsList, itemIdsList, buildBuyOnly: true, cancellationToken))
             .Select(m => new { m.Id, m.FileName, m.CompleteFileName, m.IsVaultManaged })
-            .ToListAsync(cancellationToken);
+            .ToList();
 
         var itemKeys = new ConcurrentDictionary<TGI_Key, uint>();
 
@@ -650,7 +691,7 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
             }, cancellationToken);
 
             // Persist to Database as a PlumbobForge-managed collection
-            var dbColl = await _db.Collections.Include(c => c.CollectionSets).FirstOrDefaultAsync(c => c.Id == finalId, cancellationToken);
+            var dbColl = await _db.Collections.Include(c => c.CollectionSets).Include(c => c.CollectionItems).FirstOrDefaultAsync(c => c.Id == finalId, cancellationToken);
             if (dbColl == null)
             {
                 dbColl = new CollectionEntity
@@ -678,6 +719,7 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
                 dbColl.HideFromCatalog = hideFromCatalog;
                 dbColl.UpdatedAt = DateTime.UtcNow;
                 _db.CollectionSets.RemoveRange(dbColl.CollectionSets);
+                _db.CollectionItems.RemoveRange(dbColl.CollectionItems);
             }
 
             foreach (var setId in setIdsList)
@@ -689,12 +731,21 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
                 });
             }
 
+            foreach (var itemId in itemIdsList)
+            {
+                _db.CollectionItems.Add(new CollectionItemsEntity
+                {
+                    CollectionEntityId = finalId,
+                    MetaEntityId = itemId
+                });
+            }
+
             await _db.SaveChangesAsync(cancellationToken);
 
             // Synchronize Hider Override Package in Mods/Overrides
             if (hideFromCatalog)
             {
-                await _hiderService.GenerateHiderPackageAsync(finalId, name, setIdsList, cancellationToken);
+                await _hiderService.GenerateHiderPackageAsync(finalId, name, setIdsList, cancellationToken, itemIdsList);
             }
             else
             {
@@ -760,9 +811,10 @@ CREATE TABLE IF NOT EXISTS CollectionSets (
         ulong collectionId,
         string collectionName,
         IEnumerable<long> includedSetIds,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IEnumerable<long>? includedItemIds = null)
     {
-        var hiderRes = await _hiderService.GenerateHiderPackageAsync(collectionId, collectionName, includedSetIds, cancellationToken);
+        var hiderRes = await _hiderService.GenerateHiderPackageAsync(collectionId, collectionName, includedSetIds, cancellationToken, includedItemIds);
         return _hiderService.GenerateHiderXml(collectionName, hiderRes.ObjectGuids);
     }
 
