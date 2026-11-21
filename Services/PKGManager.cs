@@ -64,6 +64,7 @@ public class PKGManager
             await CheckOrphanPackagesAsync();
             await CheckSetParentingAsync();
             await CheckConfigurationsAsync();
+            await ScriptModTags.TagLibraryOnceAsync(_db, _options.DocumentBaseDir);
         }
         catch (Exception ex)
         {
@@ -445,6 +446,7 @@ public class PKGManager
                     Filehash = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}"
                 };
                 typeInfo.ApplyBuildBuyTo(meta);
+                ScriptModTags.Apply(meta);
 
                 if (tombstone != null)
                 {
@@ -968,6 +970,7 @@ public class PKGManager
                         Filehash = $"{fileInfo.Length}_{fileInfo.LastWriteTimeUtc.Ticks}"
                     };
                     typeInfo.ApplyBuildBuyTo(meta);
+                    ScriptModTags.Apply(meta);
 
                     if (tombstone != null)
                     {
