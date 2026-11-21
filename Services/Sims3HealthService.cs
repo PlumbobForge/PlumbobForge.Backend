@@ -922,8 +922,10 @@ public class Sims3HealthService
         IOrderedEnumerable<int> ordered;
         if (Options.EnableSingleSourceVault)
         {
-            // Resource.cfg lists the shard folders alphabetically; inside a shard the item imported first wins.
+            // Resource.cfg lists the shard folders by their set's priority (higher wins), then alphabetically; inside a
+            // shard the item imported first wins.
             var shardPaths = new Dictionary<long, string>();
+            var shardPriorities = new Dictionary<long, int>();
             try
             {
                 string vaultRoot = VaultService.GetVaultRootDirectory(_cacheBuilderService.GetSims3FolderPath());
@@ -931,6 +933,7 @@ public class Sims3HealthService
                 foreach (var shard in shards)
                 {
                     shardPaths[shard.Id] = VaultService.ResolveShardPath(vaultRoot, shard, shard.SetsEntity);
+                    shardPriorities[shard.Id] = shard.SetsEntity?.Priority ?? SetsEntity.DefaultPriority;
                 }
             }
             catch
@@ -940,9 +943,12 @@ public class Sims3HealthService
 
             string ShardPath(int i) =>
                 entities[i]!.VaultShardId is long id && shardPaths.TryGetValue(id, out var path) ? path : string.Empty;
+            int ShardPriority(int i) =>
+                entities[i]!.VaultShardId is long id && shardPriorities.TryGetValue(id, out var priority) ? priority : SetsEntity.DefaultPriority;
 
             ordered = included
                 .OrderBy(i => ShardPath(i).Length == 0 ? 1 : 0)
+                .ThenByDescending(ShardPriority)
                 .ThenBy(ShardPath, StringComparer.OrdinalIgnoreCase)
                 .ThenBy(i => ConfigurationScope.TopLevelId(entities[i]!))
                 .ThenBy(i => entities[i]!.Id);
@@ -950,17 +956,31 @@ public class Sims3HealthService
         else
         {
             // Same sort as the cache merge (first copy kept). Dynamic mode builds one cache per set, listed in
-            // Resource.cfg by set id, with the configuration item cache last; static mode merges everything into one.
+            // Resource.cfg by set priority (higher wins) and set id, with the configuration item cache last under the
+            // highest of those priorities; static mode merges everything into one.
             bool isStatic = string.Equals(Options.CacheMethod, "Static", StringComparison.OrdinalIgnoreCase);
+            var setPriorities = isStatic
+                ? new Dictionary<long, int>()
+                : await _db.SetsEntities.AsNoTracking()
+                    .Where(s => scope.SetIds.Contains(s.Id))
+                    .ToDictionaryAsync(s => s.Id, s => s.Priority);
+            int configItemsPriority = setPriorities.Count > 0 ? setPriorities.Values.Max() : SetsEntity.DefaultPriority;
+
+            bool InSetCache(MetaEntity m) => !m.ExcludedByAnyConfig && m.SetsEntityId is long setId && scope.SetIds.Contains(setId);
+            int FolderPriority(MetaEntity m)
+            {
+                if (isStatic) return SetsEntity.DefaultPriority;
+                return InSetCache(m) && setPriorities.TryGetValue(m.SetsEntityId!.Value, out var priority) ? priority : configItemsPriority;
+            }
             long FolderOrder(MetaEntity m)
             {
                 if (isStatic) return 0;
-                bool inSetCache = !m.ExcludedByAnyConfig && m.SetsEntityId is long setId && scope.SetIds.Contains(setId);
-                return inSetCache ? m.SetsEntityId!.Value : long.MaxValue;
+                return InSetCache(m) ? m.SetsEntityId!.Value : long.MaxValue;
             }
 
             ordered = included
-                .OrderBy(i => FolderOrder(entities[i]!))
+                .OrderByDescending(i => FolderPriority(entities[i]!))
+                .ThenBy(i => FolderOrder(entities[i]!))
                 .ThenBy(i => CacheBuilderService.GetPackageTypePriority(entities[i]!.PackageType))
                 .ThenBy(i => entities[i]!.PackageType)
                 .ThenBy(i => entities[i]!.FileName)

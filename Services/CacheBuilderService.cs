@@ -231,12 +231,22 @@ public class CacheBuilderService
             {
                 string configResourceCfg = Path.Combine(sims3ConfigDir, "Resource.cfg");
                 var cfg = new StringBuilder();
-                cfg.AppendLine("Priority 500");
+                cfg.AppendLine($"Priority {SetsEntity.DefaultPriority}");
                 if (activeConfig != null)
                 {
-                    foreach (var cs in activeConfig.ConfigSetsEntities.OrderBy(cs => cs.SetsEntityId))
+                    // Each set keeps its own load priority; a "Priority" line applies to the PackedFile lines below it.
+                    // With every set at the default this writes exactly the lines it did before.
+                    int currentPriority = SetsEntity.DefaultPriority;
+                    foreach (var cs in activeConfig.ConfigSetsEntities
+                                 .Where(cs => cs.SetsEntity != null)
+                                 .OrderBy(cs => cs.SetsEntity!.Priority)
+                                 .ThenBy(cs => cs.SetsEntityId))
                     {
-                        if (cs.SetsEntity == null) continue;
+                        if (cs.SetsEntity!.Priority != currentPriority)
+                        {
+                            currentPriority = cs.SetsEntity.Priority;
+                            cfg.AppendLine($"Priority {currentPriority}");
+                        }
 
                         string folderName = GetSetFolderName(cs.SetsEntity.Id);
                         cfg.AppendLine($"PackedFile \"../{folderName}/*.package\"");
@@ -245,6 +255,8 @@ public class CacheBuilderService
                         AddNonPackageTargets(Path.Combine(GetSetPath(cs.SetsEntity), "NonPackageItems.txt"), targetFilesToSync);
                     }
                 }
+                // The configuration item cache stays under the last (highest) priority written above, so an item moved
+                // there out of its set's bundle never loads lower than its set does.
                 string configItemsPath = GetSetCachePath(ConfigItemsFolderName);
                 if (Directory.Exists(configItemsPath))
                 {
@@ -529,17 +541,25 @@ public class CacheBuilderService
             .ToListAsync();
 
         string vaultRoot = VaultService.GetVaultRootDirectory(GetSims3FolderPath());
+        // A shard folder shared by several sets loads at the highest of their priorities.
         var shardDirs = shards
-            .Select(s => Path.GetDirectoryName(VaultService.ResolveShardPath(vaultRoot, s, s.SetsEntity))!)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(d => d, StringComparer.OrdinalIgnoreCase)
+            .GroupBy(s => Path.GetDirectoryName(VaultService.ResolveShardPath(vaultRoot, s, s.SetsEntity))!, StringComparer.OrdinalIgnoreCase)
+            .Select(g => (Dir: g.Key, Priority: g.Max(s => s.SetsEntity?.Priority ?? SetsEntity.DefaultPriority)))
+            .OrderBy(d => d.Priority)
+            .ThenBy(d => d.Dir, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         string configResourceCfg = Path.Combine(sims3ConfigDir, "Resource.cfg");
         var cfg = new StringBuilder();
-        cfg.AppendLine("Priority 500");
-        foreach (var dir in shardDirs)
+        cfg.AppendLine($"Priority {SetsEntity.DefaultPriority}");
+        int currentPriority = SetsEntity.DefaultPriority;
+        foreach (var (dir, priority) in shardDirs)
         {
+            if (priority != currentPriority)
+            {
+                currentPriority = priority;
+                cfg.AppendLine($"Priority {currentPriority}");
+            }
             string rel = Path.GetRelativePath(vaultRoot, dir).Replace('\\', '/');
             cfg.AppendLine($"PackedFile \"../../PF_Vault/{rel}/*.package\"");
         }

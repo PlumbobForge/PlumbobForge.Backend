@@ -5,6 +5,9 @@ namespace PlumbobForge.Backend.Database;
 
 public class SetsEntity
 {
+    // The Priority the game's own Mods/Resource.cfg gives Packages; a higher value loads later and wins conflicts.
+    public const int DefaultPriority = 500;
+
     public long Id { get; set; }
     [Required] public string Name { get; set; } = string.Empty;
     public string FolderName { get; set; } = string.Empty;
@@ -17,6 +20,7 @@ public class SetsEntity
     public string? Description { get; set; }
     public string? Icon { get; set; }
     public string? Color { get; set; }
+    public int Priority { get; set; } = DefaultPriority;
     
     public long? ParentSetsEntityId { get; set; }
     public SetsEntity? ParentSetsEntity { get; set; }
