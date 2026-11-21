@@ -271,7 +271,8 @@ public class Sims3HealthService
         catch { }
     }
 
-    public async Task<CacheCleanResult> ClearCachesAsync(IEnumerable<string> groupIds)
+    // onlyFileNames limits the clear to those file names (the core cache files ticked in the cache file picker).
+    public async Task<CacheCleanResult> ClearCachesAsync(IEnumerable<string> groupIds, IReadOnlyCollection<string>? onlyFileNames = null)
     {
         return await Task.Run(async () =>
         {
@@ -283,6 +284,11 @@ public class Sims3HealthService
             {
                 foreach (var path in group.FilePaths)
                 {
+                    if (onlyFileNames != null && !onlyFileNames.Contains(Path.GetFileName(path), StringComparer.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
                     // Guard: absolute safety check for ccmerged.package
                     if (Path.GetFileName(path).Equals("ccmerged.package", StringComparison.OrdinalIgnoreCase))
                     {
