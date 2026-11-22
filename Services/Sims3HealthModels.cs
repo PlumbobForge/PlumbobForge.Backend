@@ -136,6 +136,9 @@ public class PackageConflictItem
     public bool IsLoadedByConfiguration { get; set; } = true;
     // Position in the game's load order; the lowest loaded rank is the copy the game uses (the first copy wins).
     public int LoadRank { get; set; } = int.MaxValue;
+    // A file in the game's Mods folder, turned on and off by renaming it (".disabled").
+    public bool IsModsItem { get; set; }
+    public long? ModsFolderId { get; set; }
 }
 
 public class ConflictCardModel
@@ -210,6 +213,8 @@ public class PatternIssueItem
     public long? SetId { get; set; }
     public long? MetaEntityId { get; set; }
     public bool IsVaultItem { get; set; }
+    // A file in the game's Mods folder (SetName is then "Mods/<folder>").
+    public bool IsModsItem { get; set; }
     public string PatternName { get; set; } = "Unknown Pattern";
     public string Category { get; set; } = "General";
     public int CorruptedKeyCount { get; set; }

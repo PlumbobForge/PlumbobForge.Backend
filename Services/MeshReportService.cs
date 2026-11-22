@@ -19,6 +19,8 @@ public sealed class MeshReportRow
     public string SetName { get; init; } = string.Empty;
     public string FileName { get; init; } = string.Empty;
     public bool IsVault { get; init; }
+    // A file in the game's Mods folder; SetName is then its folder ("Mods/...").
+    public bool IsModsItem { get; init; }
 
     public InspectedObjectKind Kind { get; init; }
     public string? Name { get; init; }
@@ -32,6 +34,8 @@ public sealed class MeshReportRow
     public int Triangles { get; init; }
     public int Vertices { get; init; }
     public int LodCount { get; init; }
+    // Before the CC optimizer changed it; only filled by ScanOptimizedItemAsync.
+    public int? TrianglesBefore { get; init; }
 
     public bool IsCas => Kind == InspectedObjectKind.Cas;
     public MeshWeightLevel Level => MeshWeight.Of(IsCas, Triangles);
@@ -93,9 +97,12 @@ public class MeshReportService
             {
                 MetaEntityId = meta.Id,
                 SetId = meta.SetsEntityId,
-                SetName = meta.SetsEntity?.Name ?? string.Empty,
+                SetName = meta.IsModsItem
+                    ? (string.IsNullOrEmpty(meta.ModsFolder?.RelativePath) ? "Mods" : $"Mods/{meta.ModsFolder!.RelativePath}")
+                    : meta.SetsEntity?.Name ?? string.Empty,
                 FileName = meta.FileName,
                 IsVault = meta.IsVaultManaged,
+                IsModsItem = meta.IsModsItem,
                 Kind = obj.Kind,
                 Name = obj.Name ?? obj.InternalName,
                 ClothingType = obj.ClothingType,
@@ -105,17 +112,24 @@ public class MeshReportService
                 Thumbnail = ReadThumbnail(inspection, obj),
                 Triangles = mesh.Triangles,
                 Vertices = mesh.Vertices,
-                LodCount = mesh.Lods.Count
+                LodCount = mesh.Lods.Count,
+                TrianglesBefore = obj.OriginalMesh?.Triangles
             });
         }
         return external;
     }
 
     // Rows for one item, after a tool changed its meshes; null when the item is gone or unreadable.
-    public async Task<List<MeshReportRow>?> ScanItemAsync(long metaEntityId, CancellationToken ct = default)
+    public Task<List<MeshReportRow>?> ScanItemAsync(long metaEntityId, CancellationToken ct = default) => ScanItemAsync(metaEntityId, false, ct);
+
+    // Like ScanItemAsync, with TrianglesBefore filled from the optimizer's backups; empty when nothing of it is optimized any more.
+    public Task<List<MeshReportRow>?> ScanOptimizedItemAsync(long metaEntityId, CancellationToken ct = default) => ScanItemAsync(metaEntityId, true, ct);
+
+    private async Task<List<MeshReportRow>?> ScanItemAsync(long metaEntityId, bool withOriginals, CancellationToken ct)
     {
-        var meta = await _db.MetaEntities.AsNoTracking()
+        var meta = await _db.AllMetaEntities.AsNoTracking()
             .Include(m => m.SetsEntity)
+            .Include(m => m.ModsFolder)
             .FirstOrDefaultAsync(m => m.Id == metaEntityId, ct);
         if (meta == null) return null;
 
@@ -128,11 +142,15 @@ public class MeshReportService
 
         try
         {
-            using var inspection = await _inspector.InspectAsync(meta.Id, ct);
+            using var inspection = meta.IsModsItem
+                ? PackageInspectorService.InspectFile(meta.CompleteFileName, ct)
+                : await _inspector.InspectAsync(meta.Id, ct);
             var rows = new List<MeshReportRow>();
             await Task.Run(() =>
             {
-                MeshStatsService.Analyse(inspection, ct);
+                var originals = withOriginals ? MeshBackupStore.ValidOriginals(meta.Id, inspection) : null;
+                if (withOriginals && originals!.Count == 0) return;
+                MeshStatsService.Analyse(inspection, ct, originals);
                 CollectRows(meta, inspection, disabled, rows.Add);
             }, ct);
             return rows;
@@ -147,13 +165,25 @@ public class MeshReportService
         }
     }
 
-    public async Task<MeshReportSummary> ScanAsync(IProgress<(int Done, int Total)>? progress = null, CancellationToken ct = default)
+    // onlyItems limits the scan to those items (a library menu's Open In > Mesh Report); null scans everything.
+    public async Task<MeshReportSummary> ScanAsync(IProgress<(int Done, int Total)>? progress = null, CancellationToken ct = default, IReadOnlyCollection<long>? onlyItems = null)
     {
         // A vault Sims3Pack's own packages are items of their own; they are read through the parent.
         var metas = await _db.MetaEntities.AsNoTracking()
             .Include(m => m.SetsEntity)
             .Where(m => m.ParentMetaEntityId == null)
             .ToListAsync(ct);
+        // Package files in the game's Mods folder too (Sims3Packs there aren't loaded by the game).
+        var modsItems = await _db.AllMetaEntities.AsNoTracking()
+            .Include(m => m.ModsFolder)
+            .Where(m => m.IsModsItem && m.ParentMetaEntityId == null)
+            .ToListAsync(ct);
+        metas.AddRange(modsItems.Where(m => ModsResourceCfg.StripDisabled(m.CompleteFileName).EndsWith(".package", StringComparison.OrdinalIgnoreCase)));
+        if (onlyItems != null)
+        {
+            var only = onlyItems.ToHashSet();
+            metas.RemoveAll(m => !only.Contains(m.Id));
+        }
 
         var disabled = (await _db.DisabledObjects.AsNoTracking()
                 .Select(d => new { d.MetaEntityId, d.Type, d.Group, d.Instance })

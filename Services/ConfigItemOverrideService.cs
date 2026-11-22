@@ -37,7 +37,8 @@ public class ConfigItemOverrideService
     private async Task<List<long>> ToTopLevelIdsAsync(IEnumerable<long> itemIds)
     {
         var ids = itemIds.Distinct().ToList();
-        return await _db.MetaEntities
+        // Mods items take rules too.
+        return await _db.AllMetaEntities
             .Where(m => ids.Contains(m.Id))
             .Select(m => m.ParentMetaEntityId ?? m.Id)
             .Distinct()
@@ -47,7 +48,7 @@ public class ConfigItemOverrideService
     public async Task<List<ConfigItemRuleSummary>> SummarizeAsync(IEnumerable<long> itemIds)
     {
         var topIds = await ToTopLevelIdsAsync(itemIds);
-        var items = await _db.MetaEntities.AsNoTracking()
+        var items = await _db.AllMetaEntities.AsNoTracking()
             .Where(m => topIds.Contains(m.Id))
             .Select(m => new { m.Id, m.SetsEntityId })
             .ToListAsync();

@@ -92,7 +92,7 @@ public class CasFlagsService
         foreach (var id in itemIds)
         {
             ct.ThrowIfCancellationRequested();
-            string fileName = await _db.MetaEntities.Where(m => m.Id == id).Select(m => m.FileName).FirstOrDefaultAsync(ct) ?? id.ToString();
+            string fileName = await _db.AllMetaEntities.Where(m => m.Id == id).Select(m => m.FileName).FirstOrDefaultAsync(ct) ?? id.ToString();
             try
             {
                 List<PartEdits> parts;
@@ -155,7 +155,7 @@ public class CasFlagsService
     {
         await _editor.ApplyAsync(itemId, parts);
         await RefreshOutfitMetadataAsync(itemId);
-        if (await _db.MetaEntities.Where(m => m.Id == itemId).Select(m => m.IsVaultManaged).FirstOrDefaultAsync())
+        if (await _db.AllMetaEntities.Where(m => m.Id == itemId).Select(m => m.IsVaultManaged).FirstOrDefaultAsync())
         {
             _cacheBuilder.OnGameContentChanged();
         }
@@ -165,10 +165,10 @@ public class CasFlagsService
     {
         try
         {
-            var meta = await _db.MetaEntities.FirstOrDefaultAsync(m => m.Id == itemId);
+            var meta = await _db.AllMetaEntities.FirstOrDefaultAsync(m => m.Id == itemId);
             if (meta == null || meta.IsUserTagged || !File.Exists(meta.CompleteFileName)) return;
 
-            bool isSims3Pack = meta.FileType == "TS3PACK" || meta.FileName.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase);
+            bool isSims3Pack = meta.FileType == "TS3PACK" || ModsResourceCfg.StripDisabled(meta.FileName).EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase);
             PackageTypeInfo typeInfo;
             if (meta.IsVaultManaged)
             {

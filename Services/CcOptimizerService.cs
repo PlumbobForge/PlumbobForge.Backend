@@ -662,7 +662,7 @@ public class CcOptimizerService
     {
         if (edits.Count == 0) return;
         await _editor.ApplyAsync(itemId, edits);
-        if (await _db.MetaEntities.Where(m => m.Id == itemId).Select(m => m.IsVaultManaged).FirstOrDefaultAsync())
+        if (await _db.AllMetaEntities.Where(m => m.Id == itemId).Select(m => m.IsVaultManaged).FirstOrDefaultAsync())
         {
             _cacheBuilder.OnGameContentChanged();
         }

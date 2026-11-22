@@ -1,3 +1,4 @@
+using System.Linq;
 using Microsoft.EntityFrameworkCore;
 
 namespace PlumbobForge.Backend.Database;
@@ -18,6 +19,16 @@ public class AppDbContext : DbContext
     public DbSet<VaultHoleEntity> VaultHoles { get; set; }
     public DbSet<DisabledObjectEntity> DisabledObjects { get; set; }
     public DbSet<ConfigItemOverrideEntity> ConfigItemOverrides { get; set; }
+    public DbSet<ModsFolderEntity> ModsFolders { get; set; }
+    public DbSet<ConfigModsFolderOffEntity> ConfigModsFoldersOff { get; set; }
+
+    // Every item including Mods folder files, which MetaEntities leaves out. With Mods folder support off this is
+    // the same as MetaEntities, so tools stop showing Mods items.
+    public IQueryable<MetaEntity> AllMetaEntities => PlumbobForge.Backend.Configuration.ModsFolderSupport.IsEnabled
+        ? MetaEntities.IgnoreQueryFilters() : MetaEntities;
+
+    // Mods items whether or not support is on: Mods folder housekeeping and cleanup that must not mistake them for orphans.
+    public IQueryable<MetaEntity> EveryMetaEntity => MetaEntities.IgnoreQueryFilters();
 
     public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
 
@@ -191,5 +202,53 @@ public class AppDbContext : DbContext
 
         modelBuilder.Entity<ConfigItemOverrideEntity>()
             .HasIndex(o => o.MetaEntityId);
+
+        // Files in the game's Mods folder are managed in place. Library and vault code was written for items it owns;
+        // hiding Mods items from every query by default keeps it from renaming, deduplicating or rebuilding them.
+        // Code that handles Mods items reads AllMetaEntities.
+        modelBuilder.Entity<MetaEntity>()
+            .HasQueryFilter(m => !m.IsModsItem);
+
+        modelBuilder.Entity<MetaEntity>()
+            .HasOne(m => m.ModsFolder)
+            .WithMany(f => f.MetaEntities)
+            .HasForeignKey(m => m.ModsFolderId)
+            .OnDelete(DeleteBehavior.SetNull);
+
+        modelBuilder.Entity<MetaEntity>()
+            .HasIndex(m => m.ModsFolderId);
+
+        modelBuilder.Entity<ModsFolderEntity>()
+            .HasOne(f => f.ParentModsFolder)
+            .WithMany(f => f.Children)
+            .HasForeignKey(f => f.ParentModsFolderId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        modelBuilder.Entity<ModsFolderEntity>()
+            .Property(f => f.RelativePath)
+            .UseCollation("NOCASE");
+
+        modelBuilder.Entity<ModsFolderEntity>()
+            .HasIndex(f => f.RelativePath)
+            .IsUnique();
+
+        modelBuilder.Entity<ConfigModsFolderOffEntity>()
+            .HasOne(o => o.ConfigEntity)
+            .WithMany(c => c.ModsFoldersOff)
+            .HasForeignKey(o => o.ConfigEntityId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<ConfigModsFolderOffEntity>()
+            .HasOne(o => o.ModsFolder)
+            .WithMany()
+            .HasForeignKey(o => o.ModsFolderId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        modelBuilder.Entity<ConfigModsFolderOffEntity>()
+            .HasIndex(o => new { o.ConfigEntityId, o.ModsFolderId })
+            .IsUnique();
+
+        modelBuilder.Entity<ConfigModsFolderOffEntity>()
+            .HasIndex(o => o.ModsFolderId);
     }
 }

@@ -49,6 +49,16 @@ public class MetaEntity
     public long? VaultShardId { get; set; }
     public VaultShardEntity? VaultShard { get; set; }
 
+    // A file in the game's Mods folder, managed where it lies. MetaEntities leaves these out (query filter in
+    // AppDbContext) so library and vault code never sees them; AllMetaEntities includes them.
+    // CompleteFileName is the file's current path (ending in .disabled while it is off); FileName never has
+    // the .disabled suffix. ModsPriority is the Resource.cfg priority it loads at, null when Resource.cfg doesn't
+    // load it (too deep, a .sims3pack, or a folder Resource.cfg doesn't list).
+    public bool IsModsItem { get; set; }
+    public long? ModsFolderId { get; set; }
+    public ModsFolderEntity? ModsFolder { get; set; }
+    public int? ModsPriority { get; set; }
+
     public long? ParentMetaEntityId { get; set; }
     public MetaEntity? ParentMetaEntity { get; set; }
     public ICollection<MetaEntity> SubItems { get; set; } = new List<MetaEntity>();

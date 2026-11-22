@@ -130,10 +130,31 @@ public class CacheBuilderService
             string staticCacheDir = Path.Combine(sims3CacheDir, "StaticCache");
 
             Directory.CreateDirectory(sims3ModsDir);
-            Directory.CreateDirectory(sims3CacheDir);
-            Directory.CreateDirectory(sims3ConfigDir);
+            bool modsOnly = ModsFolderSupport.ModsOnly;
+            if (!modsOnly)
+            {
+                Directory.CreateDirectory(sims3CacheDir);
+                Directory.CreateDirectory(sims3ConfigDir);
+            }
 
-            EnsureMainResourceCfg(sims3ModsDir);
+            EnsureMainResourceCfg(sims3ModsDir, includeCacheLine: !modsOnly);
+
+            // Mods files follow the active configuration by being renamed to or from ".disabled".
+            if (_services?.GetService(typeof(ModsFolderService)) is ModsFolderService mods)
+            {
+                try
+                {
+                    var applied = await mods.ApplyConfigurationAsync();
+                    if (applied.Failed.Count > 0) onProgress?.Invoke($"{applied.Failed.Count} Mods file(s) could not be turned on or off.");
+                }
+                catch (Exception ex)
+                {
+                    onProgress?.Invoke($"Could not apply the configuration to the Mods folder: {ex.Message}");
+                }
+            }
+
+            // Mods-only storage: no library or vault, so there is nothing else to build.
+            if (modsOnly) return;
 
             var activeConfig = await _db.ConfigEntities
                 .Include(c => c.ConfigSetsEntities)
@@ -1523,12 +1544,14 @@ public class CacheBuilderService
         try
         {
             string modsDir = Path.Combine(GetSims3FolderPath(), "Mods");
-            if (File.Exists(Path.Combine(modsDir, "Resource.cfg"))) EnsureMainResourceCfg(modsDir);
+            if (!ModsFolderSupport.ModsOnly && File.Exists(Path.Combine(modsDir, "Resource.cfg"))) EnsureMainResourceCfg(modsDir);
         }
         catch { }
     }
 
-    private void EnsureMainResourceCfg(string sims3ModsDir)
+    // includeCacheLine false (Mods-only storage): writes the standard file when there is none, without the line that
+    // loads PlumbobForge's caches, and leaves an existing one alone.
+    private void EnsureMainResourceCfg(string sims3ModsDir, bool includeCacheLine = true)
     {
         string mainResourceCfg = Path.Combine(sims3ModsDir, "Resource.cfg");
         string configScanLine = ConfigScanLine;
@@ -1538,7 +1561,7 @@ public class CacheBuilderService
             {
                 using var sw = new StreamWriter(mainResourceCfg, false);
                 sw.WriteLine("Priority 500");
-                sw.WriteLine(configScanLine);
+                if (includeCacheLine) sw.WriteLine(configScanLine);
                 sw.WriteLine("PackedFile Packages/*.package");
                 sw.WriteLine("PackedFile Packages/*/*.package");
                 sw.WriteLine("PackedFile Packages/*/*/*.package");
@@ -1553,7 +1576,7 @@ public class CacheBuilderService
             }
             catch { }
         }
-        else
+        else if (includeCacheLine)
         {
             try
             {

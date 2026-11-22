@@ -18,6 +18,8 @@ public sealed class InspectedResource
     public int ChunkLength { get; init; }
     public int ResourceLength { get; init; }
     public bool IsCompressed { get; init; }
+    // A turned-off object's catalog resource in a Mods file, stored under a PlumbobForge-only type (Key is its own).
+    public bool IsParked { get; init; }
 
     public string TypeTag => Sims3ResourceTypes.GetTag(Key.Type);
 

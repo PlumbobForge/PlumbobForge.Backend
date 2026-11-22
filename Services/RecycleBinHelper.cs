@@ -29,6 +29,7 @@ namespace PlumbobForge.Backend.Services
         public static bool SendToRecycleBin(string path)
         {
             if (string.IsNullOrEmpty(path)) return false;
+            if (PlumbobForge.Backend.Configuration.AppPaths.IsSandboxed) return MoveToSandboxBin(path);
 
             try
             {
@@ -42,6 +43,24 @@ namespace PlumbobForge.Backend.Services
 
                 int result = SHFileOperation(ref shf);
                 return result == 0 && !shf.fAnyOperationsAborted;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Sandbox mode (tests, copied databases) keeps "recycled" files in the sandbox, out of the user's Recycle Bin.
+        private static bool MoveToSandboxBin(string path)
+        {
+            try
+            {
+                string bin = System.IO.Path.Combine(PlumbobForge.Backend.Configuration.AppPaths.AppDataDir, "RecycleBin", Guid.NewGuid().ToString("N"));
+                System.IO.Directory.CreateDirectory(bin);
+                string target = System.IO.Path.Combine(bin, System.IO.Path.GetFileName(path.TrimEnd('\\', '/')));
+                if (System.IO.Directory.Exists(path)) System.IO.Directory.Move(path, target);
+                else System.IO.File.Move(path, target);
+                return true;
             }
             catch
             {

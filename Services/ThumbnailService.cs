@@ -59,7 +59,7 @@ public class ThumbnailService
                 string thumbDir = GetThumbnailDirectory();
                 if (!Directory.Exists(thumbDir)) return 0;
 
-                var existingItemIds = (await _db.MetaEntities.AsNoTracking().Select(m => m.Id).ToListAsync())
+                var existingItemIds = (await _db.EveryMetaEntity.AsNoTracking().Select(m => m.Id).ToListAsync())
                     .ToHashSet();
 
                 var files = Directory.GetFiles(thumbDir, "*.*");
@@ -244,7 +244,7 @@ public class ThumbnailService
             return null;
         }
 
-        var item = await _db.MetaEntities.AsNoTracking().Include(m => m.VaultChunks).FirstOrDefaultAsync(m => m.Id == itemId);
+        var item = await _db.AllMetaEntities.AsNoTracking().Include(m => m.VaultChunks).FirstOrDefaultAsync(m => m.Id == itemId);
         if (item != null && item.IsVaultManaged)
         {
             var targetChunks = item.VaultChunks;
@@ -303,7 +303,7 @@ public class ThumbnailService
 
         try
         {
-            if (filePath.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase))
+            if (ModsResourceCfg.StripDisabled(filePath).EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase))
             {
                 using var sims3Pack = new Sims3Pack(filePath);
                 if (sims3Pack.Thumbnails != null && sims3Pack.Thumbnails.Count > 0)

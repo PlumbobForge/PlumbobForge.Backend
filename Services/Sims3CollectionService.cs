@@ -235,7 +235,7 @@ public class Sims3CollectionService
             var includedIds = dbCollections.SelectMany(c => c.CollectionItems.Select(ci => ci.MetaEntityId)).Distinct().ToList();
             if (includedIds.Count > 0)
             {
-                countedItems = (await _db.MetaEntities.AsNoTracking()
+                countedItems = (await _db.AllMetaEntities.AsNoTracking()
                         .Where(m => includedIds.Contains(m.Id) && m.Enabled && PackageTypeHelper.BuildBuyTypes.Contains(m.PackageType))
                         .Select(m => new { m.Id, m.SetsEntityId })
                         .ToListAsync(cancellationToken))
@@ -482,7 +482,8 @@ CREATE INDEX IF NOT EXISTS IX_CollectionItems_MetaEntityId ON CollectionItems (M
     {
         var allSetIds = await SetHierarchyHelper.GetAllDescendantSetIdsAsync(db, setIds.Distinct().ToList(), cancellationToken);
         var ids = (itemIds ?? Enumerable.Empty<long>()).Distinct().ToList();
-        var query = db.MetaEntities.AsNoTracking()
+        // Items picked one by one may be Mods folder files.
+        var query = db.AllMetaEntities.AsNoTracking()
             .Where(m => m.Enabled && (
                 (m.SetsEntityId.HasValue && allSetIds.Contains(m.SetsEntityId.Value)) ||
                 ids.Contains(m.Id) ||

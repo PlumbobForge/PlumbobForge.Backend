@@ -22,6 +22,8 @@ public sealed class PackageInspection : IDisposable
     public string FileName { get; }
     public bool IsVault { get; }
     public bool IsSims3Pack { get; }
+    // A file in the game's Mods folder: changes are written straight into it.
+    public bool IsModsFile { get; internal set; }
 
     public List<InspectedPart> Parts { get; } = new();
     public List<InspectedResource> Resources { get; } = new();
@@ -93,7 +95,7 @@ public class PackageInspectorService
 
     public async Task<PackageInspection> InspectAsync(long metaEntityId, CancellationToken ct = default)
     {
-        var meta = await _db.MetaEntities.AsNoTracking()
+        var meta = await _db.AllMetaEntities.AsNoTracking()
             .Include(m => m.VaultChunks)
             .FirstOrDefaultAsync(m => m.Id == metaEntityId, ct)
             ?? throw new InvalidOperationException($"Item {metaEntityId} no longer exists");
@@ -117,9 +119,11 @@ public class PackageInspectorService
             .ToHashSet();
 
         var inspection = await Task.Run(() => Build(meta, children, ct), ct);
+        inspection.IsModsFile = meta.IsModsItem;
         foreach (var obj in inspection.Objects)
         {
-            obj.IsDisabled = disabled.Contains(obj.Resource.Key);
+            // A Mods file says itself which objects are off.
+            obj.IsDisabled = meta.IsModsItem ? obj.Resource.IsParked : disabled.Contains(obj.Resource.Key);
         }
         return inspection;
     }
@@ -162,7 +166,7 @@ public class PackageInspectorService
             throw new FileNotFoundException("The item's file is missing", path);
         }
 
-        if (path.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase))
+        if (ModsResourceCfg.StripDisabled(path).EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase))
         {
             var s3p = new Sims3Pack(path);
             inspection.Own(s3p);
@@ -201,9 +205,11 @@ public class PackageInspectorService
         long bytes = 0;
         foreach (var r in pkg.Resources)
         {
+            bool parked = ModsObjectParking.TryUnpark(r.Key, out var key);
             inspection.Resources.Add(new InspectedResource
             {
-                Key = r.Key,
+                Key = key,
+                IsParked = parked,
                 PartIndex = partIndex,
                 ChunkLength = r.ChunkLength,
                 ResourceLength = (int)r.Length,

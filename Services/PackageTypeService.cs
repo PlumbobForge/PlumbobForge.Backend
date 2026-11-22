@@ -21,10 +21,10 @@ public class PackageTypeService
 
     public PackageTypeInfo DetectPackageType(string filePath, bool isSims3Pack)
     {
+        var packages = new List<S3ForgeTools.GameFiles.Package.DBPFPackage>();
+        S3ForgeTools.GameFiles.TS3Pack.Sims3Pack? s3p = null;
         try
         {
-            var packages = new List<S3ForgeTools.GameFiles.Package.DBPFPackage>();
-            S3ForgeTools.GameFiles.TS3Pack.Sims3Pack? s3p = null;
 
             bool isWorld = filePath.EndsWith(".world", StringComparison.OrdinalIgnoreCase);
             bool isSim = filePath.EndsWith(".sim", StringComparison.OrdinalIgnoreCase);
@@ -58,7 +58,13 @@ public class PackageTypeService
             }
             else
             {
-                packages.Add(new S3ForgeTools.GameFiles.Package.DBPFPackage(filePath));
+                // DBPFPackage(path) only closes its file on InvalidDataException; a truncated package would stay
+                // open until garbage collection, and a Mods file can't be renamed (turned off) while it is.
+                var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
+                var package = new S3ForgeTools.GameFiles.Package.DBPFPackage();
+                try { package.Import(stream, UseBuffer: false); }
+                catch { stream.Dispose(); throw; }
+                packages.Add(package);
             }
 
             if (isWorld)
@@ -241,7 +247,15 @@ public class PackageTypeService
                 return new PackageTypeInfo("CAS", joinedCat);
             }
         }
-        catch { /* ignore parsing errors */ }
+        catch
+        {
+            // Parsing errors are ignored, but the files must not stay open.
+            try { s3p?.Dispose(); } catch { }
+            if (!isSims3Pack)
+            {
+                foreach (var p in packages) { try { p.Dispose(); } catch { } }
+            }
+        }
 
         return PackageTypeInfo.Other;
     }

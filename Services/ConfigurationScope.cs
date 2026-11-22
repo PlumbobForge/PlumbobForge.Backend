@@ -14,11 +14,14 @@ public sealed class ConfigurationScope
     public IReadOnlySet<long> SetIds { get; }
     /// <summary>Top-level item id → true (always included) / false (always excluded).</summary>
     public IReadOnlyDictionary<long, bool> Overrides { get; }
+    // Mods folders the configuration turns off. Every other Mods folder is on.
+    public IReadOnlySet<long> OffModsFolderIds { get; }
 
-    public ConfigurationScope(IReadOnlySet<long> setIds, IReadOnlyDictionary<long, bool> overrides)
+    public ConfigurationScope(IReadOnlySet<long> setIds, IReadOnlyDictionary<long, bool> overrides, IReadOnlySet<long>? offModsFolderIds = null)
     {
         SetIds = setIds;
         Overrides = overrides;
+        OffModsFolderIds = offModsFolderIds ?? new HashSet<long>();
     }
 
     public static async Task<ConfigurationScope> LoadActiveAsync(AppDbContext db)
@@ -37,7 +40,11 @@ public sealed class ConfigurationScope
             .Where(o => o.ConfigEntityId == configId)
             .Select(o => new { o.MetaEntityId, o.Include })
             .ToDictionaryAsync(o => o.MetaEntityId, o => o.Include);
-        return new ConfigurationScope(setIds.ToHashSet(), overrides);
+        var offFolders = await db.ConfigModsFoldersOff.AsNoTracking()
+            .Where(o => o.ConfigEntityId == configId)
+            .Select(o => o.ModsFolderId)
+            .ToListAsync();
+        return new ConfigurationScope(setIds.ToHashSet(), overrides, offFolders.ToHashSet());
     }
 
     public static long TopLevelId(MetaEntity item) => item.ParentMetaEntityId ?? item.Id;
@@ -47,7 +54,16 @@ public sealed class ConfigurationScope
             ? include
             : setId.HasValue && SetIds.Contains(setId.Value);
 
-    public bool Includes(MetaEntity item) => Includes(TopLevelId(item), item.SetsEntityId);
+    public bool Includes(MetaEntity item) => item.IsModsItem
+        ? IncludesModsItem(item.Id, item.ModsFolderId)
+        : Includes(TopLevelId(item), item.SetsEntityId);
+
+    // A Mods file follows its own rule, else the folder it sits in. Files straight in a load root have no folder and
+    // are always on. With no configuration at all, everything in Mods is on.
+    public bool IncludesModsItem(long itemId, long? modsFolderId) =>
+        Overrides.TryGetValue(itemId, out bool include)
+            ? include
+            : !modsFolderId.HasValue || !OffModsFolderIds.Contains(modsFolderId.Value);
 
     public bool IsLoaded(MetaEntity item) => item.Enabled && Includes(item);
 

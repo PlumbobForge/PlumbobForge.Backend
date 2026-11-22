@@ -16,4 +16,5 @@ public class ConfigEntity
     public ICollection<ConfigSetsEntity> ConfigSetsEntities { get; set; } = new List<ConfigSetsEntity>();
     public ICollection<SettingEntity> SettingEntities { get; set; } = new List<SettingEntity>();
     public ICollection<ConfigItemOverrideEntity> ItemOverrides { get; set; } = new List<ConfigItemOverrideEntity>();
+    public ICollection<ConfigModsFolderOffEntity> ModsFoldersOff { get; set; } = new List<ConfigModsFolderOffEntity>();
 }

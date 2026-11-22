@@ -32,6 +32,9 @@ public class PKGManager
 
     public VaultService Vault => _vaultService;
 
+    // ModsFolderService needs PKGManager, so it is resolved when an import goes to the Mods folder.
+    private readonly IServiceProvider _services;
+
     public PKGManager(
         AppDbContext db,
         IOptionsMonitor<PlumbobForgeOptions> options,
@@ -42,8 +45,10 @@ public class PKGManager
         CacheBuilderService cacheBuilderService,
         MigrationService migrationService,
         VaultService vaultService,
-        Sims3HiderService hiderService)
+        Sims3HiderService hiderService,
+        IServiceProvider services)
     {
+        _services = services;
         _hiderService = hiderService;
         _db = db;
         _optionsMonitor = options;
@@ -144,8 +149,14 @@ public class PKGManager
 
     public List<string> GetDuplicateFiles(IEnumerable<string> fileNames) => _archiveService.GetDuplicateFiles(fileNames);
 
-    public async Task<List<MetaEntity>> ImportFilesAsync(string[] files, Action<string>? onProgress = null, string duplicateAction = "rename", long? targetSetId = null)
+    // targetModsFolderId: import into that Mods folder. Mods-only storage always imports into the Mods folder.
+    public async Task<List<MetaEntity>> ImportFilesAsync(string[] files, Action<string>? onProgress = null, string duplicateAction = "rename", long? targetSetId = null, long? targetModsFolderId = null)
     {
+        if (ModsFolderSupport.ModsOnly || (targetModsFolderId.HasValue && ModsFolderSupport.IsEnabled))
+        {
+            var mods = (ModsFolderService)_services.GetService(typeof(ModsFolderService))!;
+            return await mods.ImportToModsAsync(files, targetModsFolderId, duplicateAction, onProgress);
+        }
         CreateFolders();
         if (_options.EnableSingleSourceVault)
         {
@@ -621,7 +632,7 @@ public class PKGManager
 
             string fileName = Path.GetFileName(file);
 
-            if (_options.EnableSingleSourceVault)
+            if (_options.EnableSingleSourceVault || ModsFolderSupport.ModsOnly)
             {
                 // Archives and single files alike: ImportFilesAsync stages a copy and honours the duplicate choice.
                 var importedMetas = await ImportFilesAsync(new[] { file }, onProgress, duplicateAction);
@@ -669,7 +680,7 @@ public class PKGManager
 
         if (importedCount > 0)
         {
-            if (!_options.EnableSingleSourceVault)
+            if (!_options.EnableSingleSourceVault && !ModsFolderSupport.ModsOnly)
             {
                 progress?.UpdateStep(stepId, title: _localizer.GetString("progress.registering_imported_files"));
                 onProgress?.Invoke("Registering imported files...");

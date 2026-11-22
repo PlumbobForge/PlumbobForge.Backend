@@ -328,6 +328,11 @@ public class Sims3HealthService
         public ulong ContentChecksum;
         public bool IsLoaded;
         public int LoadRank;
+        public bool IsModsItem;
+        public long? ModsFolderId;
+        // Mods files: Resource.cfg priority and line of the pattern that loads them.
+        public int CfgPriority;
+        public int CfgOrder;
     }
 
     private static bool TryReadPackageIndexFast(
@@ -460,10 +465,7 @@ public class Sims3HealthService
             string libraryDir = Options.ManagedPackageFolderPath;
 
             bool vaultMode = Options.EnableSingleSourceVault;
-            if (!vaultMode && (string.IsNullOrEmpty(libraryDir) || !Directory.Exists(libraryDir)))
-            {
-                return summary;
-            }
+            bool hasLibraryDir = !string.IsNullOrEmpty(libraryDir) && Directory.Exists(libraryDir);
 
             progress?.StartStep("fetch_db", _localizer.GetString("progress.loading_db_index"), badge: null, progress: 0.0);
 
@@ -512,7 +514,7 @@ public class Sims3HealthService
             else
             {
                 // 2. Discover package files in Library directory
-                var diskFiles = Directory.GetFiles(libraryDir, "*.package", SearchOption.AllDirectories)
+                var diskFiles = (hasLibraryDir ? Directory.GetFiles(libraryDir, "*.package", SearchOption.AllDirectories) : Array.Empty<string>())
                     .Where(f => !Path.GetFileName(f).StartsWith("._", StringComparison.OrdinalIgnoreCase))
                     .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
                     .ToList();
@@ -615,10 +617,28 @@ public class Sims3HealthService
                 });
             }
 
+            // Files in the game's Mods folder load next to the library and can collide with it.
+            var modsCfg = ModsResourceCfg.Load(Path.Combine(_cacheBuilderService.GetSims3FolderPath(), "Mods"));
+            var (modsMeta, modsEntities, modsKeys) = await LoadModsPackagesAsync(modsCfg, scope, vaultMode, corruptCards, cancellationToken);
+            if (modsMeta.Length > 0)
+            {
+                int offset = packagesMeta.Length;
+                for (int i = 0; i < modsMeta.Length; i++) modsMeta[i].Id = offset + i;
+                packagesMeta = packagesMeta.Concat(modsMeta).ToArray();
+                packageEntities = packageEntities.Concat(modsEntities).ToArray();
+                packageKeysList = packageKeysList.Concat(modsKeys).ToArray();
+                summary.TotalPackagesScanned += modsMeta.Length;
+                total += modsMeta.Length;
+            }
+            if (packagesMeta.Length == 0 && corruptCards.IsEmpty)
+            {
+                return summary;
+            }
+
             progress?.CompleteStep("scan_packages", finalBadge: _localizer.GetString("progress.items_merged_badge", total, total));
             progress?.StartStep("analyze_conflicts", _localizer.GetString("progress.grouping_problems"), badge: null, progress: 0.0);
 
-            await AssignLoadRanksAsync(packagesMeta, packageEntities, scope);
+            await AssignLoadRanksAsync(packagesMeta, packageEntities, scope, modsCfg);
 
             PackageConflictItem ToConflictItem(CompactPackageMeta p) => new()
             {
@@ -630,7 +650,9 @@ public class Sims3HealthService
                 PackageType = p.PackageType,
                 IsEnabled = p.IsEnabled,
                 IsLoadedByConfiguration = p.IsLoaded,
-                LoadRank = p.LoadRank
+                LoadRank = p.LoadRank,
+                IsModsItem = p.IsModsItem,
+                ModsFolderId = p.ModsFolderId
             };
 
             // 3. Inverted Index: TGI_Key -> List of package IDs
@@ -912,12 +934,15 @@ public class Sims3HealthService
     // Ranks every package the active configuration loads in the order its copy of a shared resource would be kept,
     // mirroring how CacheBuilderService and VaultService lay items out. Disabled items are ranked too, so a package
     // switched on from the scanner lands in the right place.
-    private async Task AssignLoadRanksAsync(CompactPackageMeta[] packages, MetaEntity?[] entities, ConfigurationScope scope)
+    private async Task AssignLoadRanksAsync(CompactPackageMeta[] packages, MetaEntity?[] entities, ConfigurationScope scope, ModsResourceCfg? modsCfg = null)
     {
         var included = Enumerable.Range(0, packages.Length)
-            .Where(i => packages[i].IsLoaded && entities[i] != null)
+            .Where(i => packages[i].IsLoaded && entities[i] != null && !packages[i].IsModsItem)
             .ToList();
-        if (included.Count == 0) return;
+        var includedMods = Enumerable.Range(0, packages.Length)
+            .Where(i => packages[i].IsLoaded && packages[i].IsModsItem)
+            .ToList();
+        if (included.Count == 0 && includedMods.Count == 0) return;
 
         IOrderedEnumerable<int> ordered;
         if (Options.EnableSingleSourceVault)
@@ -967,11 +992,122 @@ public class Sims3HealthService
                 .ThenBy(i => entities[i]!.Id);
         }
 
+        // Library and Mods files together: the higher Resource.cfg priority wins; at the same priority, the line read
+        // first. PlumbobForge's caches (or shards) all load from the Scan of Cache/Config, at that line's place.
+        int libraryPriority = modsCfg?.CacheConfigPriority ?? 500;
+        int libraryOrder = modsCfg?.CacheConfigOrder ?? -1;
+        var positions = new List<(int Index, int Priority, int Order, int Sequence, string Path)>();
+        int seq = 0;
+        foreach (int i in ordered) positions.Add((i, libraryPriority, libraryOrder, seq++, string.Empty));
+        foreach (int i in includedMods) positions.Add((i, packages[i].CfgPriority, packages[i].CfgOrder, 0, packages[i].FilePath));
+
         int rank = 0;
-        foreach (int i in ordered)
+        foreach (var p in positions
+                     .OrderByDescending(p => p.Priority)
+                     .ThenBy(p => p.Order)
+                     .ThenBy(p => p.Sequence)
+                     .ThenBy(p => p.Path, StringComparer.OrdinalIgnoreCase))
         {
-            packages[i].LoadRank = rank++;
+            packages[p.Index].LoadRank = rank++;
         }
+    }
+
+    // One entry per package file in the game's Mods folder (Sims3Packs aren't loaded from there). Loaded when the
+    // active configuration lets it and a Resource.cfg line reaches it. In vault mode the keys are filtered like the
+    // vault's index, so a Mods copy of a vault item shows up as an exact duplicate.
+    private async Task<(CompactPackageMeta[] Packages, MetaEntity?[] Entities, List<TGI_Key>[] Keys)> LoadModsPackagesAsync(
+        ModsResourceCfg cfg, ConfigurationScope scope, bool vaultMode, ConcurrentBag<ConflictCardModel> corruptCards, CancellationToken cancellationToken)
+    {
+        var items = await _db.AllMetaEntities.AsNoTracking()
+            .Include(m => m.ModsFolder)
+            .Where(m => m.IsModsItem && m.ParentMetaEntityId == null)
+            .ToListAsync(cancellationToken);
+        items = items
+            .Where(m => ModsResourceCfg.StripDisabled(m.CompleteFileName).EndsWith(".package", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(m => m.CompleteFileName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var packages = new CompactPackageMeta[items.Count];
+        var keyLists = new List<TGI_Key>[items.Count];
+        var readable = new bool[items.Count];
+        await Task.Run(() => Parallel.For(0, items.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount, 1, 8), CancellationToken = cancellationToken },
+            i =>
+            {
+                var meta = items[i];
+                string folder = meta.ModsFolder?.RelativePath ?? string.Empty;
+                string setName = folder.Length == 0 ? "Mods" : $"Mods/{folder}";
+                string? rel = cfg.ToRelative(meta.CompleteFileName);
+                var position = rel == null ? null : cfg.LoadPositionOf(rel);
+                bool isLoaded = position != null && scope.Includes(meta);
+
+                if (!File.Exists(meta.CompleteFileName)) return;
+                if (!TryReadPackageIndexFast(meta.CompleteFileName, out var keys, out ulong checksum, out string? error))
+                {
+                    bool isS2 = error?.Contains("Sims 2") == true;
+                    corruptCards.Add(new ConflictCardModel
+                    {
+                        Category = ConflictCardCategory.CorruptFile,
+                        Title = isS2 ? "Sims 2 Package Detected" : "Corrupt / Invalid Package",
+                        Explanation = isS2
+                            ? "This file is in Sims 2 package format. Placing it in The Sims 3 may crash the game on startup."
+                            : (error ?? "Package header is broken or truncated and cannot be read by the game."),
+                        Recommendation = "We recommend disabling or deleting this file from your Mods folder.",
+                        Packages = new List<PackageConflictItem>
+                        {
+                            new()
+                            {
+                                PackageFileName = meta.FileName,
+                                PackagePath = meta.CompleteFileName,
+                                SetName = setName,
+                                MetaEntityId = meta.Id,
+                                PackageType = meta.PackageType,
+                                IsEnabled = meta.Enabled,
+                                IsLoadedByConfiguration = isLoaded,
+                                IsWinningInLoadOrder = meta.Enabled && isLoaded,
+                                IsModsItem = true,
+                                ModsFolderId = meta.ModsFolderId
+                            }
+                        },
+                        ConflictFingerprint = $"Corrupt:{meta.FileName.ToLowerInvariant()}",
+                        TechnicalDetails = new List<string> { error ?? "DBPF format error" }
+                    });
+                    return;
+                }
+
+                if (vaultMode)
+                {
+                    keys = keys.Where(k => CacheContentRules.IsLoadableType(k.Type)).ToList();
+                    checksum = 0;
+                    foreach (var key in keys.Distinct()) checksum ^= (ulong)key.Type ^ ((ulong)key.Group << 16) ^ key.Instance;
+                }
+
+                packages[i] = new CompactPackageMeta
+                {
+                    FileName = meta.FileName,
+                    FilePath = meta.CompleteFileName,
+                    SetName = setName,
+                    SetId = null,
+                    MetaEntityId = meta.Id,
+                    PackageType = meta.PackageType,
+                    IsEnabled = meta.Enabled,
+                    ResourceCount = keys.Count,
+                    ContentChecksum = checksum,
+                    IsLoaded = isLoaded,
+                    LoadRank = int.MaxValue,
+                    IsModsItem = true,
+                    ModsFolderId = meta.ModsFolderId,
+                    CfgPriority = position?.Priority ?? 0,
+                    CfgOrder = position?.Order ?? int.MaxValue
+                };
+                keyLists[i] = keys;
+                readable[i] = true;
+            }), cancellationToken);
+
+        var keep = Enumerable.Range(0, items.Count).Where(i => readable[i]).ToList();
+        return (keep.Select(i => packages[i]).ToArray(),
+                keep.Select(i => (MetaEntity?)items[i]).ToArray(),
+                keep.Select(i => keyLists[i]).ToArray());
     }
 
     // Vault mode: one entry per library item, with the resource keys its shard chunks hold. A Sims3Pack's parts count
@@ -1105,9 +1241,12 @@ public class Sims3HealthService
         {
             var summary = new PatternScanSummary();
 
-            var metaItems = _db.MetaEntities
+            // Mods folder files too; their own files are repaired like library files.
+            var metaItems = _db.AllMetaEntities
                 .AsNoTracking()
                 .Include(m => m.SetsEntity)
+                .Include(m => m.ModsFolder)
+                .Where(m => !m.IsModsItem || m.ParentMetaEntityId == null)
                 .ToList();
 
             summary.TotalPackagesScanned = metaItems.Count;
@@ -1154,7 +1293,7 @@ public class Sims3HealthService
                     {
                         if (!File.Exists(filePath)) return;
                         // Only inspect DBPF (.package) files directly
-                        if (filePath.EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase)) return;
+                        if (ModsResourceCfg.StripDisabled(filePath).EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase)) return;
 
                         using var pkg = new DBPFPackage(filePath);
                         // Only packages with a pattern definition resource (PTRN)
@@ -1215,10 +1354,13 @@ public class Sims3HealthService
                     {
                         PackagePath = filePath,
                         FileName = item.FileName,
-                        SetName = item.SetsEntity?.Name ?? "Uncategorized",
+                        SetName = item.IsModsItem
+                            ? (string.IsNullOrEmpty(item.ModsFolder?.RelativePath) ? "Mods" : $"Mods/{item.ModsFolder!.RelativePath}")
+                            : item.SetsEntity?.Name ?? "Uncategorized",
                         SetId = item.SetsEntityId,
                         MetaEntityId = item.Id,
                         IsVaultItem = item.IsVaultManaged,
+                        IsModsItem = item.IsModsItem,
                         PatternName = patternName,
                         Category = category,
                         CorruptedKeyCount = brokenKeysCount,

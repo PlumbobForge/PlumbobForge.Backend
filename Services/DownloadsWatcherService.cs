@@ -21,6 +21,12 @@ public class DownloadsWatcherService : BackgroundService
     private bool _isLibraryScanRunning = false;
     private bool _pendingLibraryRescan = false;
 
+    private CancellationTokenSource? _modsDebounceCts;
+    private readonly object _modsDebounceLock = new();
+    private bool _isModsScanRunning = false;
+    private bool _pendingModsRescan = false;
+    private string _modsDir = string.Empty;
+
     private CancellationTokenSource? _autoImportDebounceCts;
     private readonly object _autoImportDebounceLock = new();
     private bool _isAutoImportRunning = false;
@@ -130,6 +136,40 @@ public class DownloadsWatcherService : BackgroundService
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to start watcher for Library folder: {Path}", libraryDir);
+            }
+
+            // Watch the game's Mods folder: files the user adds, removes, renames or turns off outside the app.
+            try
+            {
+                var modsService = scope.ServiceProvider.GetRequiredService<ModsFolderService>();
+                string modsDir = modsService.GetModsFolderPath();
+                if (!string.IsNullOrWhiteSpace(modsDir) && Directory.Exists(modsDir))
+                {
+                    _modsDir = Path.GetFullPath(modsDir);
+                    _logger.LogInformation("Starting Mods folder watcher on: {Path}", modsDir);
+                    var modsWatcher = new FileSystemWatcher(modsDir)
+                    {
+                        IncludeSubdirectories = true,
+                        InternalBufferSize = 65536,
+                        NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.DirectoryName,
+                        Filter = "",
+                        EnableRaisingEvents = true
+                    };
+                    modsWatcher.Created += OnModsFileEvent;
+                    modsWatcher.Changed += OnModsFileEvent;
+                    modsWatcher.Deleted += OnModsFileEvent;
+                    modsWatcher.Renamed += OnModsFileRenamed;
+                    modsWatcher.Error += (s, e) =>
+                    {
+                        _logger.LogWarning(e.GetException(), "Mods FileSystemWatcher error encountered.");
+                        ScheduleDebouncedModsScan();
+                    };
+                    _watchers.Add(modsWatcher);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to start watcher for the Mods folder");
             }
 
             // 3. Determine observed folders
@@ -251,6 +291,96 @@ public class DownloadsWatcherService : BackgroundService
         if (IsPackageExtension(e.FullPath) || IsPackageExtension(e.OldFullPath))
         {
             ScheduleDebouncedLibraryScan();
+        }
+    }
+
+    private void OnModsFileEvent(object sender, FileSystemEventArgs e)
+    {
+        if (IsRelevantModsPath(e.FullPath, e.ChangeType != WatcherChangeTypes.Changed)) ScheduleDebouncedModsScan();
+    }
+
+    private void OnModsFileRenamed(object sender, RenamedEventArgs e)
+    {
+        if (IsRelevantModsPath(e.FullPath, true) || IsRelevantModsPath(e.OldFullPath, true)) ScheduleDebouncedModsScan();
+    }
+
+    // Mods files, Resource.cfg files and (for adds, removes and renames) folders, outside PlumbobForge's own folders,
+    // whose cache and vault writes would otherwise trigger a scan each time.
+    private bool IsRelevantModsPath(string path, bool folderEvent)
+    {
+        if (!PlumbobForge.Backend.Configuration.ModsFolderSupport.IsEnabled) return false;
+        if (string.IsNullOrWhiteSpace(path) || string.IsNullOrEmpty(_modsDir)) return false;
+        string rel;
+        try { rel = Path.GetRelativePath(_modsDir, path).Replace('\\', '/'); }
+        catch { return false; }
+        if (rel.StartsWith("../", StringComparison.Ordinal) || ModsResourceCfg.IsPlumbobForgePath(rel)) return false;
+        string name = Path.GetFileName(path);
+        if (name.Equals("Resource.cfg", StringComparison.OrdinalIgnoreCase)) return true;
+        if (ModsFolderService.IsModFile(path)) return true;
+        return folderEvent && Path.GetExtension(name).Length == 0;
+    }
+
+    private void ScheduleDebouncedModsScan()
+    {
+        lock (_modsDebounceLock)
+        {
+            _modsDebounceCts?.Cancel();
+            _modsDebounceCts?.Dispose();
+            _modsDebounceCts = new CancellationTokenSource();
+            var token = _modsDebounceCts.Token;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(1500, token);
+                    if (token.IsCancellationRequested) return;
+                    await ExecuteModsScanWithCoalescingAsync();
+                }
+                catch (OperationCanceledException) { }
+            }, token);
+        }
+    }
+
+    private async Task ExecuteModsScanWithCoalescingAsync()
+    {
+        lock (_modsDebounceLock)
+        {
+            if (_isModsScanRunning)
+            {
+                _pendingModsRescan = true;
+                return;
+            }
+            _isModsScanRunning = true;
+        }
+
+        try
+        {
+            bool again;
+            do
+            {
+                lock (_modsDebounceLock) _pendingModsRescan = false;
+                try
+                {
+                    using var scope = _serviceProvider.CreateScope();
+                    var result = await scope.ServiceProvider.GetRequiredService<ModsFolderService>().ScanAsync();
+                    // The app's own renames already match the database, so they report no change and cause no reload.
+                    if (result.Added + result.Updated + result.Removed > 0)
+                    {
+                        await scope.ServiceProvider.GetRequiredService<NotificationService>()
+                            .BroadcastAsync("library_changed", new { reason = "Mods folder changed" });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error during Mods folder rescan.");
+                }
+                lock (_modsDebounceLock) again = _pendingModsRescan;
+            } while (again);
+        }
+        finally
+        {
+            lock (_modsDebounceLock) _isModsScanRunning = false;
         }
     }
 
@@ -450,6 +580,11 @@ public class DownloadsWatcherService : BackgroundService
         {
             _autoImportDebounceCts?.Cancel();
             _autoImportDebounceCts?.Dispose();
+        }
+        lock (_modsDebounceLock)
+        {
+            _modsDebounceCts?.Cancel();
+            _modsDebounceCts?.Dispose();
         }
         base.Dispose();
     }

@@ -19,7 +19,31 @@ public static class MeshBackupStore
     private const string IndexName = "index.json";
     private static readonly object _lock = new();
 
-    private static string Folder(long itemId) => Path.Combine(AppPaths.AppDataDir, "OptimizerBackups", itemId.ToString());
+    private static string Root => Path.Combine(AppPaths.AppDataDir, "OptimizerBackups");
+    private static string Folder(long itemId) => Path.Combine(Root, itemId.ToString());
+
+    // Items with a backup, and when they were last optimized (the index is rewritten on every save).
+    public static Dictionary<long, DateTime> OptimizedItems()
+    {
+        var result = new Dictionary<long, DateTime>();
+        lock (_lock)
+        {
+            if (!Directory.Exists(Root)) return result;
+            foreach (var dir in Directory.EnumerateDirectories(Root))
+            {
+                if (!long.TryParse(Path.GetFileName(dir), out long id)) continue;
+                string index = Path.Combine(dir, IndexName);
+                try
+                {
+                    if (File.Exists(index) && Load(id).Count > 0) result[id] = File.GetLastWriteTime(index);
+                }
+                catch (Exception)
+                {
+                }
+            }
+        }
+        return result;
+    }
 
     public static bool HasEntries(long itemId)
     {
@@ -105,7 +129,7 @@ public static class MeshBackupStore
 
     public static void Prune(IReadOnlySet<long> existingItems)
     {
-        string root = Path.Combine(AppPaths.AppDataDir, "OptimizerBackups");
+        string root = Root;
         lock (_lock)
         {
             if (!Directory.Exists(root)) return;

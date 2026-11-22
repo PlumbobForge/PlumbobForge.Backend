@@ -25,6 +25,12 @@ public class PlumbobForgeOptions
     public double CustomThemeIntensity { get; set; } = 45.0;
     public string CacheMethod { get; set; } = "Dynamic";
     public bool EnableSingleSourceVault { get; set; } = false;
+    // Mods folder support: PlumbobForge lists and manages the files in the game's Mods folder.
+    public bool EnableModsFolder { get; set; } = false;
+    // Mods-only storage mode: no library or vault.
+    public bool ModsOnly { get; set; } = false;
+    // Existing users are asked once after updating whether to turn Mods folder support on.
+    public bool HasAnsweredModsSupport { get; set; } = false;
     public bool AutoRebuildStaticCache { get; set; } = false;
     public bool EnableAutoScan { get; set; } = true;
     // Off by default: deleting compositorCache/simCompositorCache makes the game rebuild textures while it runs (stutter).

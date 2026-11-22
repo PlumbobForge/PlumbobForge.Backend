@@ -32,7 +32,7 @@ public class PackageEditService
         parts = parts.Where(p => p.Edits.Count > 0).ToList();
         if (parts.Count == 0) return;
 
-        var meta = await _db.MetaEntities.FirstOrDefaultAsync(m => m.Id == metaEntityId)
+        var meta = await _db.AllMetaEntities.FirstOrDefaultAsync(m => m.Id == metaEntityId)
             ?? throw new InvalidOperationException($"Item {metaEntityId} no longer exists");
 
         if (meta.IsVaultManaged)
@@ -51,6 +51,17 @@ public class PackageEditService
         Sims3GameProcess.ThrowIfGameRunning("Close The Sims 3 before changing the contents of an item.");
         string path = meta.CompleteFileName;
         if (!File.Exists(path)) throw new FileNotFoundException("The item's file is missing", path);
+
+        if (meta.IsModsItem && !IsSims3PackPath(path))
+        {
+            // Changes to a turned-off object go to its parked copy.
+            var keys = await Task.Run(() =>
+            {
+                using var pkg = new DBPFPackage(path);
+                return pkg.Resources.Select(r => r.Key).ToHashSet();
+            });
+            parts = parts.Select(p => p with { Edits = ModsObjectParking.RedirectToParked(p.Edits, keys) }).ToList();
+        }
 
         await Task.Run(() => RewriteLibraryFile(path, parts));
 
@@ -78,8 +89,11 @@ public class PackageEditService
     {
         if (changes.Count == 0) return;
 
-        var meta = await _db.MetaEntities.FirstOrDefaultAsync(m => m.Id == metaEntityId)
+        var meta = await _db.AllMetaEntities.FirstOrDefaultAsync(m => m.Id == metaEntityId)
             ?? throw new InvalidOperationException($"Item {metaEntityId} no longer exists");
+
+        // A Mods file has no rebuild to leave objects out: the file itself changes first, then the rows follow.
+        if (meta.IsModsItem) await SetModsObjectsEnabledAsync(meta, changes);
 
         var rows = await _db.DisabledObjects.Where(d => d.MetaEntityId == meta.Id).ToListAsync();
         foreach (var change in changes)
@@ -112,6 +126,28 @@ public class PackageEditService
         {
             await _vaultService.RefreshItemIndexesAsync(meta.Id);
         }
+    }
+
+    private static bool IsSims3PackPath(string path) =>
+        ModsResourceCfg.StripDisabled(path).EndsWith(".sims3pack", StringComparison.OrdinalIgnoreCase);
+
+    private async Task SetModsObjectsEnabledAsync(MetaEntity meta, IReadOnlyList<ObjectToggle> changes)
+    {
+        string path = meta.CompleteFileName;
+        // The game doesn't load Sims3Packs from Mods, so there is nothing to turn off in one.
+        if (IsSims3PackPath(path)) throw new InvalidOperationException("Objects in a Sims3Pack in the Mods folder can't be turned off; move it to a set first.");
+        Sims3GameProcess.ThrowIfGameRunning("Close The Sims 3 before changing the contents of an item.");
+        if (!File.Exists(path)) throw new FileNotFoundException("The item's file is missing", path);
+
+        await Task.Run(() =>
+        {
+            var edits = ModsObjectParking.BuildToggleEdits(path, changes);
+            if (edits.Count > 0) RewriteLibraryFile(path, new[] { new PartEdits(0, null, edits) });
+        });
+
+        var info = new FileInfo(path);
+        meta.FileSize = info.Length / 1024.0;
+        meta.Filehash = $"{info.Length}_{info.LastWriteTimeUtc.Ticks}";
     }
 
     private static string ComputeStamp(IEnumerable<DisabledObjectEntity> rows)
