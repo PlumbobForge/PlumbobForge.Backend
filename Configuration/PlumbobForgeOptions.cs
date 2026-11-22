@@ -14,6 +14,8 @@ public class PlumbobForgeOptions
     public string Sims3UserDir { get; set; } = "";
     public bool HasSeenWalkthrough { get; set; } = false;
     public bool HasCompletedUpgradeWizard { get; set; } = false;
+    // The one-time "Feedback moved to the ? menu" callout.
+    public bool HasSeenHelpMoveTip { get; set; } = false;
     public string Language { get; set; } = "auto";
     public string Theme { get; set; } = "Dark";
     public string AccentColor { get; set; } = "Emerald";
@@ -44,8 +46,6 @@ public class PlumbobForgeOptions
     public string LastActiveTool { get; set; } = "Cache";
     // Tool sections pinned as their own title-bar tabs, in pin order.
     public System.Collections.Generic.List<string> PinnedTools { get; set; } = new();
-    public int LastOptimizedCacheMilestone { get; set; } = 0;
-    public string LastOptimizedCacheVersion { get; set; } = "";
 
     public string DownloadFolderPath => string.IsNullOrEmpty(DownloadFolderName) ? "" : System.IO.Path.Combine(DocumentBaseDir, DownloadFolderName);
     public string ArchiveFolderPath => string.IsNullOrEmpty(ArchiveFolderName) ? "" : System.IO.Path.Combine(DocumentBaseDir, ArchiveFolderName);
