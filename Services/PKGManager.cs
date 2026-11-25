@@ -122,9 +122,19 @@ public class PKGManager
                     }
                 }
 
+                // Damaged packages that were merged after in-memory repairs (the files themselves are unchanged).
+                var repairedFiles = _cacheBuilderService.TakeRepairedFiles();
+                if (repairedFiles.Count > 0)
+                {
+                    var details = repairedFiles.Select(f => $"{f.FileName}: {f.Summary}").ToList();
+                    progress?.WarningStep("repaired", _localizer.GetString("progress.damaged_repaired_title"), _localizer.GetString("progress.damaged_repaired_badge", repairedFiles.Count), details);
+                    foreach (var line in details) onProgress?.Invoke($"  - {line}");
+                }
+
                 // 4. Syncing Step
                 progress?.StartStep("sync", _localizer.GetString("progress.syncing_cache_to_sims3"), badge: null, progress: 0.0);
-                await SyncToSims3Async(onProgress, forceRebuildStatic: forceRebuild);
+                // Step 2 has already built the static bundle; forcing it here would build the whole thing a second time.
+                await SyncToSims3Async(onProgress, forceRebuildStatic: false);
                 progress?.CompleteStep("sync");
 
                 onProgress?.Invoke(_localizer.GetString("scan_complete"));

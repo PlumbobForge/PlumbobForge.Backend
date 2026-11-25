@@ -14,12 +14,15 @@ namespace PlumbobForge.Backend.Services;
 public class ArchiveService
 {
     private readonly AppDbContext _db;
-    private readonly PlumbobForgeOptions _options;
+    // Read live: long-lived holders (the library view) would otherwise keep using the folders from when they were
+    // created, e.g. the old library folder after it moves.
+    private readonly IOptionsMonitor<PlumbobForgeOptions> _optionsMonitor;
+    private PlumbobForgeOptions _options => _optionsMonitor.CurrentValue;
 
-    public ArchiveService(AppDbContext db, IOptionsSnapshot<PlumbobForgeOptions> options)
+    public ArchiveService(AppDbContext db, IOptionsMonitor<PlumbobForgeOptions> options)
     {
         _db = db;
-        _options = options.Value;
+        _optionsMonitor = options;
     }
 
     public static bool IsArchiveExtension(string filePath)

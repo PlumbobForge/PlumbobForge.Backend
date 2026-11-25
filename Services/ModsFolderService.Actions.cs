@@ -125,17 +125,6 @@ public partial class ModsFolderService
         return true;
     }
 
-    // Sends the folder and everything in it to the Recycle Bin.
-    public async Task<bool> DeleteFolderAsync(long folderId)
-    {
-        var folder = await _db.ModsFolders.FirstOrDefaultAsync(f => f.Id == folderId);
-        if (folder == null || GetRootFolderPaths().Contains(folder.RelativePath)) return false;
-        string full = FolderFullPath(folder.RelativePath);
-        bool ok = !Directory.Exists(full) || RecycleBinHelper.SendToRecycleBin(full);
-        await ScanAsync();
-        return ok;
-    }
-
     // Renames a Mods file, keeping its extension and ".disabled".
     public async Task<bool> RenameItemAsync(long itemId, string newBaseName)
     {

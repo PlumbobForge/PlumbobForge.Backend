@@ -171,7 +171,7 @@ public class PackageInspectorService
             var s3p = new Sims3Pack(path);
             inspection.Own(s3p);
             if (s3p.IsEncrypted) inspection.Warnings.Add(new InspectionWarning("look_inside.warning_encrypted"));
-            if (s3p.IsCorrupt) inspection.Warnings.Add(new InspectionWarning("look_inside.warning_corrupt"));
+            if (s3p.IsCorrupt || s3p.HasUnreadableParts) inspection.Warnings.Add(new InspectionWarning("look_inside.warning_corrupt"));
 
             for (int i = 0; i < s3p.Packages.Count; i++)
             {
@@ -179,6 +179,9 @@ public class PackageInspectorService
                 string label = string.IsNullOrEmpty(pkg.GUID) ? $"Package {i + 1}" : pkg.GUID + ".package";
                 AddPackage(inspection, pkg, i, label);
             }
+
+            var damage = s3p.Packages.SelectMany(p => p.Problems).Concat(s3p.PartProblems.Where(p => !p.Problem.Repaired).Select(p => p.Problem)).ToList();
+            if (damage.Count > 0) inspection.Warnings.Add(new InspectionWarning("look_inside.warning_damaged_resources", PackageValidator.Describe(damage)));
 
             foreach (var thumb in s3p.Thumbnails)
             {
@@ -196,6 +199,7 @@ public class PackageInspectorService
         {
             var pkg = new DBPFPackage(path);
             inspection.Own(pkg);
+            if (pkg.Problems.Count > 0) inspection.Warnings.Add(new InspectionWarning("look_inside.warning_damaged_resources", PackageValidator.Describe(pkg.Problems)));
             AddPackage(inspection, pkg, 0, Path.GetFileName(path));
         }
     }

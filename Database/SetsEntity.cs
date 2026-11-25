@@ -17,6 +17,8 @@ public class SetsEntity
     public string? Description { get; set; }
     public string? Icon { get; set; }
     public string? Color { get; set; }
+    // Resource.cfg load priority; null takes the parent set's (500 at the top). See SetPriorities.
+    public int? Priority { get; set; }
     
     public long? ParentSetsEntityId { get; set; }
     public SetsEntity? ParentSetsEntity { get; set; }

@@ -248,6 +248,26 @@ public class DownloadsWatcherService : BackgroundService
         }
     }
 
+    // Stops watching and lets a library rescan that is already running finish, for work that moves library files
+    // around (a rescan in the middle would see the moved files as deleted and drop their records). ReloadWatchers
+    // starts watching again.
+    public async Task PauseWatchersAsync()
+    {
+        StopWatchers();
+        lock (_libraryDebounceLock)
+        {
+            _libraryDebounceCts?.Cancel();
+            _pendingLibraryRescan = false;
+        }
+        for (int i = 0; i < 300; i++)
+        {
+            bool running;
+            lock (_libraryDebounceLock) running = _isLibraryScanRunning;
+            if (!running) return;
+            await Task.Delay(100);
+        }
+    }
+
     private void StopWatchers()
     {
         foreach (var w in _watchers)

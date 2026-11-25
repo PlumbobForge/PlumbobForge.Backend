@@ -15,11 +15,13 @@ using S3ForgeTools.GameFiles.Package;
 using S3ForgeTools.GameFiles.Textures;
 using S3ForgeTools.GameFiles.TS3Pack;
 using S3ForgeTools.Utils;
+using S3ForgeTools.Utils.Logging;
 
 namespace PlumbobForge.Backend.Services;
 
 public class CacheBuilderService
 {
+    private static readonly ILog log = LogManager.GetLogger(nameof(CacheBuilderService));
     private static readonly byte[] ColonSpaceBytes = [(byte)':', (byte)' '];
     private static readonly HashSet<char> InvalidFileNameChars = [.. Path.GetInvalidFileNameChars()];
     private static readonly HashSet<char> InvalidCacheFolderChars = [.. Path.GetInvalidFileNameChars(), '/', '\\'];
@@ -28,6 +30,17 @@ public class CacheBuilderService
     // Bump when what goes into the bundles, or how it is laid out, changes: caches written with an older
     // version are rebuilt once. 2: patterns merged, textures keep their compression, no catalog-first layout.
     private const int CacheLayoutVersion = 2;
+
+    // Items whose packages were damaged but merged after in-memory repairs (file name -> summary), since the last
+    // full rebuild started. Drained by TakeRepairedFiles.
+    private readonly ConcurrentDictionary<string, string> _repairedFiles = new(StringComparer.OrdinalIgnoreCase);
+
+    public List<(string FileName, string Summary)> TakeRepairedFiles()
+    {
+        var list = _repairedFiles.OrderBy(p => p.Key, StringComparer.OrdinalIgnoreCase).Select(p => (p.Key, p.Value)).ToList();
+        _repairedFiles.Clear();
+        return list;
+    }
     private const string CacheLayoutFile = "CacheLayout.txt";
 
     private static bool HasCurrentLayout(string cacheDir)
@@ -178,30 +191,39 @@ public class CacheBuilderService
             }
             else if (isStatic)
             {
-                string configResourceCfgStatic = Path.Combine(sims3ConfigDir, "Resource.cfg");
-                var cfg = new StringBuilder();
-                cfg.AppendLine("Priority 500");
-                cfg.AppendLine("PackedFile \"../StaticCache/*.package\"");
-                cfg.AppendLine("PackedFile \"../StaticCache/*/*.package\"");
-                resourceCfgChanged = WriteResourceCfgIfChanged(configResourceCfgStatic, cfg.ToString());
-
-                // In Static mode: Clean up old dynamic set folders from Mods/Cache/ (keep only Config and StaticCache)
+                // In Static mode: Clean up old dynamic set folders from Mods/Cache/ (keep only Config and the static caches)
                 foreach (var dir in Directory.GetDirectories(sims3CacheDir))
                 {
                     string dirName = Path.GetFileName(dir);
                     if (!dirName.Equals("Config", StringComparison.OrdinalIgnoreCase) &&
-                        !dirName.Equals("StaticCache", StringComparison.OrdinalIgnoreCase))
+                        SetPriorities.PriorityOfFolder(dirName, StaticCacheFolderName) == null)
                     {
                         try { WritableFile.DeleteDirectory(dir); } catch { }
                     }
                 }
 
-                bool staticCacheExists = Directory.Exists(staticCacheDir) && Directory.GetFiles(staticCacheDir, "StaticBundle*.package").Length > 0
-                    && HasCurrentLayout(staticCacheDir);
+                // Sets at other priorities are merged into their own StaticCache_P{n} folders.
+                bool staticCacheExists = HasCurrentLayout(staticCacheDir) &&
+                    SetPriorities.FoldersIn(sims3CacheDir, StaticCacheFolderName).Any(f => Directory.GetFiles(f.Path, "StaticBundle*.package").Length > 0);
                 if (forceRebuildStatic || !staticCacheExists)
                 {
                     await RebuildStaticCacheAsync(onProgress);
                 }
+
+                // Written from the folders that were built, so it always matches what is on disk.
+                string configResourceCfgStatic = Path.Combine(sims3ConfigDir, "Resource.cfg");
+                var staticLines = new List<(int, string)>
+                {
+                    (SetPriorities.Default, "PackedFile \"../StaticCache/*.package\""),
+                    (SetPriorities.Default, "PackedFile \"../StaticCache/*/*.package\"")
+                };
+                foreach (var (path, priority) in SetPriorities.FoldersIn(sims3CacheDir, StaticCacheFolderName).Where(f => f.Priority != SetPriorities.Default))
+                {
+                    string name = Path.GetFileName(path);
+                    staticLines.Add((priority, $"PackedFile \"../{name}/*.package\""));
+                    staticLines.Add((priority, $"PackedFile \"../{name}/*/*.package\""));
+                }
+                resourceCfgChanged = WriteResourceCfgIfChanged(configResourceCfgStatic, SetPriorities.BuildResourceCfg(staticLines));
             }
             else
             {
@@ -216,7 +238,6 @@ public class CacheBuilderService
                     .Select(GetSetFolderName)
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
                 allSetFolderNames.Add("Config");
-                allSetFolderNames.Add(ConfigItemsFolderName);
 
                 // Items the configuration includes or excludes on their own live in their own small cache.
                 try
@@ -231,7 +252,7 @@ public class CacheBuilderService
                 foreach (var dir in Directory.GetDirectories(sims3CacheDir))
                 {
                     string dirName = Path.GetFileName(dir);
-                    if (!allSetFolderNames.Contains(dirName))
+                    if (!allSetFolderNames.Contains(dirName) && SetPriorities.PriorityOfFolder(dirName, ConfigItemsFolderName) == null)
                     {
                         try { WritableFile.DeleteDirectory(dir); } catch { }
                     }
@@ -251,8 +272,8 @@ public class CacheBuilderService
             else if (!isStatic)
             {
                 string configResourceCfg = Path.Combine(sims3ConfigDir, "Resource.cfg");
-                var cfg = new StringBuilder();
-                cfg.AppendLine("Priority 500");
+                var priorities = await SetPriorities.LoadAsync(_db);
+                var lines = new List<(int, string)>();
                 if (activeConfig != null)
                 {
                     foreach (var cs in activeConfig.ConfigSetsEntities.OrderBy(cs => cs.SetsEntityId))
@@ -260,24 +281,29 @@ public class CacheBuilderService
                         if (cs.SetsEntity == null) continue;
 
                         string folderName = GetSetFolderName(cs.SetsEntity.Id);
-                        cfg.AppendLine($"PackedFile \"../{folderName}/*.package\"");
-                        cfg.AppendLine($"PackedFile \"../{folderName}/*/*.package\"");
+                        int priority = SetPriorities.Of(cs.SetsEntity.Id, priorities);
+                        lines.Add((priority, $"PackedFile \"../{folderName}/*.package\""));
+                        lines.Add((priority, $"PackedFile \"../{folderName}/*/*.package\""));
 
                         AddNonPackageTargets(Path.Combine(GetSetPath(cs.SetsEntity), "NonPackageItems.txt"), targetFilesToSync);
                     }
                 }
-                string configItemsPath = GetSetCachePath(ConfigItemsFolderName);
-                if (Directory.Exists(configItemsPath))
+                // Items the configuration includes on their own load at their set's priority, one folder per priority.
+                foreach (var (path, priority) in SetPriorities.FoldersIn(sims3CacheDir, ConfigItemsFolderName))
                 {
-                    cfg.AppendLine($"PackedFile \"../{ConfigItemsFolderName}/*.package\"");
-                    cfg.AppendLine($"PackedFile \"../{ConfigItemsFolderName}/*/*.package\"");
-                    AddNonPackageTargets(Path.Combine(configItemsPath, "NonPackageItems.txt"), targetFilesToSync);
+                    string name = Path.GetFileName(path);
+                    lines.Add((priority, $"PackedFile \"../{name}/*.package\""));
+                    lines.Add((priority, $"PackedFile \"../{name}/*/*.package\""));
+                    AddNonPackageTargets(Path.Combine(path, "NonPackageItems.txt"), targetFilesToSync);
                 }
-                resourceCfgChanged = WriteResourceCfgIfChanged(configResourceCfg, cfg.ToString());
+                resourceCfgChanged = WriteResourceCfgIfChanged(configResourceCfg, SetPriorities.BuildResourceCfg(lines));
             }
             else
             {
-                AddNonPackageTargets(Path.Combine(staticCacheDir, "NonPackageItems.txt"), targetFilesToSync);
+                foreach (var (path, _) in SetPriorities.FoldersIn(sims3CacheDir, StaticCacheFolderName))
+                {
+                    AddNonPackageTargets(Path.Combine(path, "NonPackageItems.txt"), targetFilesToSync);
+                }
             }
 
             // Sync SavedSims & Library (Lots) into Documents/Electronic Arts/The Sims 3/
@@ -550,21 +576,23 @@ public class CacheBuilderService
             .ToListAsync();
 
         string vaultRoot = VaultService.GetVaultRootDirectory(GetSims3FolderPath());
+        var priorities = await SetPriorities.LoadAsync(_db);
+        // A shard folder belongs to one set, so it loads at that set's priority.
         var shardDirs = shards
-            .Select(s => Path.GetDirectoryName(VaultService.ResolveShardPath(vaultRoot, s, s.SetsEntity))!)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(d => d, StringComparer.OrdinalIgnoreCase)
+            .Select(s => (Dir: Path.GetDirectoryName(VaultService.ResolveShardPath(vaultRoot, s, s.SetsEntity))!, Priority: SetPriorities.Of(s.SetsEntityId, priorities)))
+            .GroupBy(d => d.Dir, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .OrderBy(d => d.Dir, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         string configResourceCfg = Path.Combine(sims3ConfigDir, "Resource.cfg");
-        var cfg = new StringBuilder();
-        cfg.AppendLine("Priority 500");
-        foreach (var dir in shardDirs)
+        var lines = new List<(int, string)>();
+        foreach (var (dir, priority) in shardDirs)
         {
             string rel = Path.GetRelativePath(vaultRoot, dir).Replace('\\', '/');
-            cfg.AppendLine($"PackedFile \"../../PF_Vault/{rel}/*.package\"");
+            lines.Add((priority, $"PackedFile \"../../PF_Vault/{rel}/*.package\""));
         }
-        return WriteResourceCfgIfChanged(configResourceCfg, cfg.ToString());
+        return WriteResourceCfgIfChanged(configResourceCfg, SetPriorities.BuildResourceCfg(lines));
     }
 
     // Returns true if a folder was moved (Resource.cfg then has to be rewritten).
@@ -624,6 +652,7 @@ public class CacheBuilderService
             return;
         }
 
+        _repairedFiles.Clear();
         bool isStatic = string.Equals(_options.CacheMethod, "Static", StringComparison.OrdinalIgnoreCase);
         if (isStatic)
         {
@@ -750,7 +779,8 @@ public class CacheBuilderService
         if (total > 0 || configItemsChanged)
         {
             PruneStagedNonPackageFiles(allSets.Select(s => Path.Combine(GetSetPath(s), "NonPackageItems.txt"))
-                .Append(Path.Combine(GetSetCachePath(ConfigItemsFolderName), "NonPackageItems.txt")));
+                .Concat(SetPriorities.FoldersIn(Path.GetDirectoryName(GetSetCachePath(ConfigItemsFolderName))!, ConfigItemsFolderName)
+                    .Select(f => Path.Combine(f.Path, "NonPackageItems.txt"))));
             OnGameContentChanged();
             PruneTextureCache();
         }
@@ -884,40 +914,61 @@ public class CacheBuilderService
         int totalItems = allMetaItems.Count;
         int reportInterval = Math.Max(1, totalItems / 50);
 
+        // One bundle loads at one priority: sets with their own priority are merged into their own folder. The default
+        // folder is always built, so its layout marker says the static cache is current even when it holds nothing.
+        var priorities = await SetPriorities.LoadAsync(_db);
+        var groups = allMetaItems
+            .GroupBy(m => SetPriorities.Of(m, priorities))
+            .ToDictionary(g => g.Key, g => g.ToList());
+        if (!groups.ContainsKey(SetPriorities.Default)) groups[SetPriorities.Default] = new List<MetaEntity>();
+
         // The old bundles stay in place until the new ones are complete.
         await LoadDisabledObjectsAsync();
-        var ctx = new MergeContext(staticCacheDir, "StaticBundle_", CreateTextureCache(), skippedFiles, onProgress) { DisabledObjects = _disabledObjects };
-        DeleteStaleNewFiles(ctx);
-        MergeItems(allMetaItems, ctx, parallel: true, current =>
+        var textureCache = CreateTextureCache();
+        var contexts = new List<MergeContext>();
+        int done = 0;
+        foreach (var (priority, items) in groups.OrderBy(g => g.Key))
         {
-            if (current % reportInterval == 0 || current == totalItems)
+            string dir = Path.Combine(sims3CacheDir, SetPriorities.FolderName(StaticCacheFolderName, priority));
+            Directory.CreateDirectory(dir);
+            var ctx = new MergeContext(dir, "StaticBundle_", textureCache, skippedFiles, onProgress) { DisabledObjects = _disabledObjects };
+            contexts.Add(ctx);
+            DeleteStaleNewFiles(ctx);
+            int before = done;
+            MergeItems(items, ctx, parallel: true, current =>
             {
-                double pct = totalItems > 0 ? (double)current / totalItems : 1.0;
-                progress?.UpdateStep(staticStepId, progress: pct, badge: $"{current}/{totalItems}");
-                onProgress?.Invoke(_localizer.GetString("merging_item", current, totalItems, "StaticCache"));
-            }
-        });
+                int overall = before + current;
+                if (overall % reportInterval == 0 || overall == totalItems)
+                {
+                    double pct = totalItems > 0 ? (double)overall / totalItems : 1.0;
+                    progress?.UpdateStep(staticStepId, progress: pct, badge: $"{overall}/{totalItems}");
+                    onProgress?.Invoke(_localizer.GetString("merging_item", overall, totalItems, "StaticCache"));
+                }
+            });
+            done += items.Count;
+        }
 
-        foreach (var (entity, fallback) in ctx.FallbackUpdates)
+        foreach (var ctx in contexts)
         {
-            entity.CompleteFileName = fallback;
+            foreach (var (entity, fallback) in ctx.FallbackUpdates)
+            {
+                entity.CompleteFileName = fallback;
+            }
         }
 
         try
         {
-            FinalizeOutput(ctx);
+            foreach (var ctx in contexts) FinalizeOutput(ctx);
 
-            // In Static mode: Clean up old dynamic set folders from Mods/Cache/
+            // In Static mode: Clean up old dynamic set folders from Mods/Cache/, and priority folders no set uses now.
             if (Directory.Exists(sims3CacheDir))
             {
                 foreach (var dir in Directory.GetDirectories(sims3CacheDir))
                 {
                     string dirName = Path.GetFileName(dir);
-                    if (!dirName.Equals("Config", StringComparison.OrdinalIgnoreCase) &&
-                        !dirName.Equals("StaticCache", StringComparison.OrdinalIgnoreCase))
-                    {
-                        try { WritableFile.DeleteDirectory(dir); } catch { }
-                    }
+                    if (dirName.Equals("Config", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (SetPriorities.PriorityOfFolder(dirName, StaticCacheFolderName) is int priority && groups.ContainsKey(priority)) continue;
+                    try { WritableFile.DeleteDirectory(dir); } catch { }
                 }
             }
         }
@@ -941,7 +992,7 @@ public class CacheBuilderService
             await tracked.ReloadAsync();
         }
 
-        PruneStagedNonPackageFiles(new[] { Path.Combine(staticCacheDir, "NonPackageItems.txt") });
+        PruneStagedNonPackageFiles(contexts.Select(c => Path.Combine(c.OutputDir, "NonPackageItems.txt")));
         OnGameContentChanged();
         PruneTextureCache();
 
@@ -1087,6 +1138,7 @@ public class CacheBuilderService
     // it leaves off, and excluded-somewhere items (left out of every set bundle) that it loads. Set bundles never
     // depend on the configuration, so switching configurations or changing includes only rebuilds this small folder.
     public const string ConfigItemsFolderName = "ConfigItems";
+    public const string StaticCacheFolderName = "StaticCache";
 
     private const string ConfigItemsHashFile = "BuildHash.txt";
 
@@ -1112,17 +1164,29 @@ public class CacheBuilderService
 
         scope ??= await ConfigurationScope.LoadActiveAsync(_db);
         var items = await GetConfigItemsAsync(scope);
-        string path = GetSetCachePath(ConfigItemsFolderName);
+        // Each item loads at its own set's priority, so each priority gets its own folder.
+        var priorities = await SetPriorities.LoadAsync(_db);
+        var groups = items.GroupBy(m => SetPriorities.Of(m, priorities)).ToDictionary(g => g.Key, g => g.ToList());
+        string cacheDir = Path.GetDirectoryName(GetSetCachePath(ConfigItemsFolderName))!;
 
-        if (items.Count == 0)
+        bool changed = false;
+        foreach (var (path, priority) in SetPriorities.FoldersIn(cacheDir, ConfigItemsFolderName))
         {
-            if (!Directory.Exists(path)) return false;
+            if (groups.ContainsKey(priority)) continue;
             Sims3GameProcess.ThrowIfGameRunning(_localizer.GetString("progress.game_running_rebuild"));
             WritableFile.DeleteDirectory(path);
-            OnGameContentChanged();
-            return true;
+            changed = true;
         }
+        foreach (var (priority, group) in groups.OrderBy(g => g.Key))
+        {
+            changed |= await BuildConfigItemsFolderAsync(GetSetCachePath(SetPriorities.FolderName(ConfigItemsFolderName, priority)), group, onProgress, force);
+        }
+        if (changed) OnGameContentChanged();
+        return changed;
+    }
 
+    private async Task<bool> BuildConfigItemsFolderAsync(string path, List<MetaEntity> items, Action<string>? onProgress, bool force)
+    {
         string hash = SetDirtyTracker.ComputeContentHash(ConfigItemsFolderName, items);
         string hashFile = Path.Combine(path, ConfigItemsHashFile);
         if (!force && File.Exists(hashFile) && string.Equals(File.ReadAllText(hashFile).Trim(), hash, StringComparison.Ordinal) && HasCurrentLayout(path))
@@ -1148,7 +1212,6 @@ public class CacheBuilderService
         await _db.SaveChangesAsync();
 
         WritableFile.WriteAllText(hashFile, hash);
-        OnGameContentChanged();
         return true;
     }
 
@@ -1297,10 +1360,24 @@ public class CacheBuilderService
         try
         {
             IEnumerable<DBPFPackage> packages;
+            // Unrepaired problems: parts of a Sims3Pack that could not be read or were cut off.
+            var partFailures = new List<PackageProblem>();
             if (isSims3Pack)
             {
                 var sims3Pack = new Sims3Pack(filePath);
                 prepared.Closers.Add(sims3Pack.Dispose);
+                if (sims3Pack.Packages.Count == 0 && (sims3Pack.IsCorrupt || sims3Pack.IsEncrypted))
+                {
+                    string reason = sims3Pack.Error
+                        ?? sims3Pack.PartProblems.Select(p => p.Problem.Message).FirstOrDefault()
+                        ?? "The Sims3Pack cannot be read";
+                    prepared.Dispose();
+                    SafeAddSkippedFile(ctx.SkippedFiles, item.FileName, reason);
+                    ctx.OnProgress?.Invoke(_localizer.GetString("skipping_unreadable_sims3pack", item.FileName, reason));
+                    return null;
+                }
+                partFailures.AddRange(sims3Pack.PartProblems.Where(p => !p.Problem.Repaired)
+                    .Select(p => p.Problem with { Message = $"{p.PartName}: {p.Problem.Message}" }));
                 packages = sims3Pack.Packages;
             }
             else
@@ -1326,6 +1403,7 @@ public class CacheBuilderService
                     default:
                         if (ValidatePackage(package))
                         {
+                            PackageValidator.RepairResources(package);
                             PreparePackageResources(package, textureCache, disabledObjects);
                             prepared.ToMerge.Add(package);
                         }
@@ -1337,6 +1415,7 @@ public class CacheBuilderService
                         break;
                 }
             }
+            ReportPackageProblems(item.FileName, partFailures, prepared.ToMerge, ctx);
             return prepared;
         }
         catch (Exception ex)
@@ -1392,6 +1471,26 @@ public class CacheBuilderService
         else if (File.Exists(nonPackageFile))
         {
             try { WritableFile.Delete(nonPackageFile); } catch { }
+        }
+    }
+
+    // Repaired problems go to the repaired list; anything left unrepaired (missing Sims3Pack parts, a texture compositor
+    // that could not be corrected) is reported with the skipped files, since content may be missing or broken.
+    private void ReportPackageProblems(string fileName, List<PackageProblem> partFailures, List<DBPFPackage> merged, MergeContext ctx)
+    {
+        var problems = merged.SelectMany(p => p.Problems).ToList();
+        var repaired = problems.Where(p => p.Repaired).ToList();
+        var unrepaired = problems.Where(p => !p.Repaired).Concat(partFailures).ToList();
+        if (repaired.Count > 0)
+        {
+            string summary = PackageValidator.Summarize(repaired);
+            _repairedFiles[fileName] = summary;
+            foreach (var p in repaired) log.Info($"{fileName}: {p.Message}");
+        }
+        if (unrepaired.Count > 0)
+        {
+            SafeAddSkippedFile(ctx.SkippedFiles, fileName, string.Join(" ", unrepaired.Select(p => p.Message).Take(3))
+                + (unrepaired.Count > 3 ? $" (+{unrepaired.Count - 3} more)" : ""));
         }
     }
 
@@ -1474,7 +1573,11 @@ public class CacheBuilderService
                     outputPkg = null;
                 }
             }
-            catch (Exception) { }
+            catch (Exception ex)
+            {
+                // The builder rewinds to the last good offset, so later resources are unaffected.
+                log.Warn($"Left out {resource.Key} from {inputPkg.FileName}: {ex.Message}");
+            }
         }
     }
 

@@ -213,7 +213,7 @@ public class PackageEditService
         if (isSims3Pack)
         {
             using var s3p = new Sims3Pack(tempPath);
-            if (s3p.IsCorrupt || s3p.IsEncrypted) throw new InvalidDataException("The rewritten Sims3Pack could not be read back");
+            if (s3p.IsCorrupt || s3p.IsEncrypted || s3p.HasUnreadableParts) throw new InvalidDataException("The rewritten Sims3Pack could not be read back");
             foreach (var part in parts)
             {
                 if (part.PartIndex >= s3p.Packages.Count) throw new InvalidDataException("The rewritten Sims3Pack lost a package");

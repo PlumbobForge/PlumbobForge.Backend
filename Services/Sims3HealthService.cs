@@ -335,6 +335,55 @@ public class Sims3HealthService
         public int CfgOrder;
     }
 
+    // The fast index reader rejected the file. The full reader says why in plain words, and may still read it when the
+    // damage is one it works around (then it is a damaged package, not an unreadable one).
+    private static ConflictCardModel UnreadablePackageCard(string filePath, string? fastError, PackageConflictItem item, bool isMods, bool vaultMode)
+    {
+        var check = PackageValidator.Check(filePath, checkResources: false);
+        if (check.Readable && check.Problems.Count > 0) return DamagedPackageCard(check.Problems, item, isMods, vaultMode);
+
+        bool isS2 = check.FatalCode == PackageProblemCode.Sims2Package || fastError?.Contains("Sims 2") == true;
+        string message = check.FatalMessage ?? fastError ?? "Package header is broken or truncated and cannot be read by the game.";
+        return new ConflictCardModel
+        {
+            Category = ConflictCardCategory.CorruptFile,
+            Title = isS2 ? "Sims 2 Package Detected" : "Corrupt / Invalid Package",
+            Explanation = isS2
+                ? "This file is in Sims 2 package format. Placing it in The Sims 3 may crash the game on startup."
+                : message,
+            Recommendation = isMods
+                ? "We recommend disabling or deleting this file from your Mods folder."
+                : "We recommend disabling or deleting this file from your library.",
+            Packages = new List<PackageConflictItem> { item },
+            ConflictFingerprint = $"Corrupt:{item.PackageFileName.ToLowerInvariant()}",
+            TechnicalDetails = new List<string> { fastError ?? message }
+        };
+    }
+
+    // A readable package with damage: resources whose data is missing, a header the reader had to work around, or a
+    // texture compositor with a bad offset. The cache build works around these in memory; the game reading the file
+    // straight from the Mods folder does not.
+    private static ConflictCardModel DamagedPackageCard(IReadOnlyList<PackageProblem> problems, PackageConflictItem item, bool isMods, bool vaultMode)
+    {
+        string what = PackageValidator.Describe(problems);
+        return new ConflictCardModel
+        {
+            Category = ConflictCardCategory.CorruptFile,
+            Title = "Damaged Package",
+            Explanation = isMods
+                ? $"This package is damaged ({what}). The game reads it straight from the Mods folder, so the damage is not repaired and some of its content may be missing or broken."
+                : vaultMode
+                    ? $"This package is damaged ({what}). Some of its content may be missing or broken."
+                    : $"This package is damaged ({what}). PlumbobForge works around this when it builds the cache; the file itself is unchanged.",
+            Recommendation = isMods
+                ? "Re-download it from the creator, or move it into the library so the cache build can work around the damage."
+                : "Re-download it from the creator to get a clean copy.",
+            Packages = new List<PackageConflictItem> { item },
+            ConflictFingerprint = $"Damaged:{item.PackageFileName.ToLowerInvariant()}",
+            TechnicalDetails = problems.Select(p => p.Message).Take(10).ToList()
+        };
+    }
+
     private static bool TryReadPackageIndexFast(
         string filePath,
         out List<TGI_Key> keys,
@@ -567,34 +616,28 @@ public class Sims3HealthService
                     string? packageType = meta?.PackageType;
                     bool isEnabled = meta?.Enabled ?? true;
 
+                    PackageConflictItem CardItem() => new()
+                    {
+                        PackageFileName = fileName,
+                        PackagePath = filePath,
+                        SetName = setName,
+                        SetId = setId,
+                        MetaEntityId = metaId,
+                        PackageType = packageType,
+                        IsEnabled = isEnabled,
+                        IsLoadedByConfiguration = isLoaded,
+                        IsWinningInLoadOrder = isEnabled && isLoaded
+                    };
+
                     if (!TryReadPackageIndexFast(filePath, out var keys, out ulong checksum, out string? error))
                     {
-                        bool isS2 = error?.Contains("Sims 2") == true;
-                        var corruptPkg = new PackageConflictItem
-                        {
-                            PackageFileName = fileName,
-                            PackagePath = filePath,
-                            SetName = setName,
-                            SetId = setId,
-                            MetaEntityId = metaId,
-                            PackageType = packageType,
-                            IsEnabled = isEnabled,
-                            IsLoadedByConfiguration = isLoaded,
-                            IsWinningInLoadOrder = isEnabled && isLoaded
-                        };
-                        corruptCards.Add(new ConflictCardModel
-                        {
-                            Category = ConflictCardCategory.CorruptFile,
-                            Title = isS2 ? "Sims 2 Package Detected" : "Corrupt / Invalid Package",
-                            Explanation = isS2
-                                ? "This file is in Sims 2 package format. Placing it in The Sims 3 may crash the game on startup."
-                                : (error ?? "Package header is broken or truncated and cannot be read by the game."),
-                            Recommendation = "We recommend disabling or deleting this file from your library.",
-                            Packages = new List<PackageConflictItem> { corruptPkg },
-                            ConflictFingerprint = $"Corrupt:{fileName.ToLowerInvariant()}",
-                            TechnicalDetails = new List<string> { error ?? "DBPF format error" }
-                        });
+                        corruptCards.Add(UnreadablePackageCard(filePath, error, CardItem(), isMods: false, vaultMode));
                         return;
+                    }
+                    var damage = PackageValidator.Check(filePath);
+                    if (damage.Readable && damage.Problems.Count > 0)
+                    {
+                        corruptCards.Add(DamagedPackageCard(damage.Problems, CardItem(), isMods: false, vaultMode));
                     }
 
                     packagesMeta[i] = new CompactPackageMeta
@@ -993,12 +1036,18 @@ public class Sims3HealthService
         }
 
         // Library and Mods files together: the higher Resource.cfg priority wins; at the same priority, the line read
-        // first. PlumbobForge's caches (or shards) all load from the Scan of Cache/Config, at that line's place.
+        // first. PlumbobForge's caches (or shards) all load from the Scan of Cache/Config, at that line's place; a set
+        // with its own priority moves its items up or down from there.
         int libraryPriority = modsCfg?.CacheConfigPriority ?? 500;
         int libraryOrder = modsCfg?.CacheConfigOrder ?? -1;
+        var setPriorities = await SetPriorities.LoadAsync(_db);
         var positions = new List<(int Index, int Priority, int Order, int Sequence, string Path)>();
         int seq = 0;
-        foreach (int i in ordered) positions.Add((i, libraryPriority, libraryOrder, seq++, string.Empty));
+        foreach (int i in ordered)
+        {
+            int priority = libraryPriority + SetPriorities.Of(entities[i]!, setPriorities) - SetPriorities.Default;
+            positions.Add((i, priority, libraryOrder, seq++, string.Empty));
+        }
         foreach (int i in includedMods) positions.Add((i, packages[i].CfgPriority, packages[i].CfgOrder, 0, packages[i].FilePath));
 
         int rank = 0;
@@ -1042,37 +1091,29 @@ public class Sims3HealthService
                 bool isLoaded = position != null && scope.Includes(meta);
 
                 if (!File.Exists(meta.CompleteFileName)) return;
+                PackageConflictItem CardItem() => new()
+                {
+                    PackageFileName = meta.FileName,
+                    PackagePath = meta.CompleteFileName,
+                    SetName = setName,
+                    MetaEntityId = meta.Id,
+                    PackageType = meta.PackageType,
+                    IsEnabled = meta.Enabled,
+                    IsLoadedByConfiguration = isLoaded,
+                    IsWinningInLoadOrder = meta.Enabled && isLoaded,
+                    IsModsItem = true,
+                    ModsFolderId = meta.ModsFolderId
+                };
+
                 if (!TryReadPackageIndexFast(meta.CompleteFileName, out var keys, out ulong checksum, out string? error))
                 {
-                    bool isS2 = error?.Contains("Sims 2") == true;
-                    corruptCards.Add(new ConflictCardModel
-                    {
-                        Category = ConflictCardCategory.CorruptFile,
-                        Title = isS2 ? "Sims 2 Package Detected" : "Corrupt / Invalid Package",
-                        Explanation = isS2
-                            ? "This file is in Sims 2 package format. Placing it in The Sims 3 may crash the game on startup."
-                            : (error ?? "Package header is broken or truncated and cannot be read by the game."),
-                        Recommendation = "We recommend disabling or deleting this file from your Mods folder.",
-                        Packages = new List<PackageConflictItem>
-                        {
-                            new()
-                            {
-                                PackageFileName = meta.FileName,
-                                PackagePath = meta.CompleteFileName,
-                                SetName = setName,
-                                MetaEntityId = meta.Id,
-                                PackageType = meta.PackageType,
-                                IsEnabled = meta.Enabled,
-                                IsLoadedByConfiguration = isLoaded,
-                                IsWinningInLoadOrder = meta.Enabled && isLoaded,
-                                IsModsItem = true,
-                                ModsFolderId = meta.ModsFolderId
-                            }
-                        },
-                        ConflictFingerprint = $"Corrupt:{meta.FileName.ToLowerInvariant()}",
-                        TechnicalDetails = new List<string> { error ?? "DBPF format error" }
-                    });
+                    corruptCards.Add(UnreadablePackageCard(meta.CompleteFileName, error, CardItem(), isMods: true, vaultMode));
                     return;
+                }
+                var damage = PackageValidator.Check(meta.CompleteFileName);
+                if (damage.Readable && damage.Problems.Count > 0)
+                {
+                    corruptCards.Add(DamagedPackageCard(damage.Problems, CardItem(), isMods: true, vaultMode));
                 }
 
                 if (vaultMode)
