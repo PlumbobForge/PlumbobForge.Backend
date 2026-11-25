@@ -384,6 +384,63 @@ public class Sims3HealthService
         };
     }
 
+    // A library Sims3Pack that cannot be read at all, or whose parts are cut off or damaged. Store-protected content is
+    // not damage and gets no card.
+    private static ConflictCardModel? Sims3PackDamageCard(string filePath, PackageConflictItem item)
+    {
+        string? fatal;
+        List<(string PartName, PackageProblem Problem)> problems;
+        try
+        {
+            using var s3p = new S3ForgeTools.GameFiles.TS3Pack.Sims3Pack(filePath);
+            problems = s3p.PartProblems.Where(p => p.Problem.Code != PackageProblemCode.StoreProtected).ToList();
+            fatal = s3p.IsCorrupt && s3p.Packages.Count == 0
+                ? s3p.Error ?? problems.Select(p => p.Problem.Message).FirstOrDefault() ?? "The Sims3Pack cannot be read."
+                : null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Locked or unreadable from disk right now: not something the file itself is to blame for.
+            return null;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            fatal = $"The Sims3Pack cannot be read: {ex.Message}";
+            problems = new();
+        }
+
+        if (fatal != null)
+        {
+            return new ConflictCardModel
+            {
+                Category = ConflictCardCategory.CorruptFile,
+                Title = "Corrupt / Invalid Sims3Pack",
+                Explanation = $"{fatal} The cache build skips this file.",
+                Recommendation = "We recommend re-downloading it from the creator, or disabling or deleting it from your library.",
+                Packages = new List<PackageConflictItem> { item },
+                ConflictFingerprint = $"Corrupt:{item.PackageFileName.ToLowerInvariant()}",
+                TechnicalDetails = new List<string> { fatal }
+            };
+        }
+        if (problems.Count == 0) return null;
+
+        // A cut-off part is reported by the Sims3Pack and again by the package reader: count each kind once per part.
+        string what = PackageValidator.Describe(problems.DistinctBy(p => (p.PartName, p.Problem.Code)).Select(p => p.Problem));
+        bool lost = problems.Any(p => !p.Problem.Repaired);
+        return new ConflictCardModel
+        {
+            Category = ConflictCardCategory.CorruptFile,
+            Title = "Damaged Sims3Pack",
+            Explanation = lost
+                ? $"This Sims3Pack is damaged ({what}); the download is probably incomplete. PlumbobForge leaves out what is missing when it builds the cache, so some of its content may be missing or broken."
+                : $"This Sims3Pack is damaged ({what}). PlumbobForge works around this when it builds the cache; the file itself is unchanged.",
+            Recommendation = "Re-download it from the creator to get a clean copy.",
+            Packages = new List<PackageConflictItem> { item },
+            ConflictFingerprint = $"Damaged:{item.PackageFileName.ToLowerInvariant()}",
+            TechnicalDetails = problems.Select(p => $"{p.PartName}: {p.Problem.Message}").Take(10).ToList()
+        };
+    }
+
     private static bool TryReadPackageIndexFast(
         string filePath,
         out List<TGI_Key> keys,
@@ -657,6 +714,37 @@ public class Sims3HealthService
                     };
 
                     packageKeysList[i] = keys;
+                });
+
+                // Sims3Packs in the library: checked for damage only (cut-off downloads, parts that cannot be read). The
+                // cache build unpacks them and leaves out what is missing, so without this the damage only shows as a
+                // skipped or warned file in the build's progress.
+                var sims3Packs = (hasLibraryDir ? Directory.GetFiles(libraryDir, "*.sims3pack", SearchOption.AllDirectories) : Array.Empty<string>())
+                    .Where(f => !Path.GetFileName(f).StartsWith("._", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                summary.TotalPackagesScanned += sims3Packs.Count;
+                Parallel.ForEach(sims3Packs, parallelOptions, filePath =>
+                {
+                    string? fullPath = TryGetFullPath(filePath);
+                    if (fullPath == null || !metaByPath.TryGetValue(fullPath, out var meta))
+                    {
+                        metaMap.TryGetValue(Path.GetFileName(filePath), out meta);
+                    }
+                    bool isLoaded = meta != null && scope.Includes(meta);
+                    var item = new PackageConflictItem
+                    {
+                        PackageFileName = Path.GetFileName(filePath),
+                        PackagePath = filePath,
+                        SetName = meta?.SetsEntity?.Name ?? "Uncategorized",
+                        SetId = meta?.SetsEntityId,
+                        MetaEntityId = meta?.Id,
+                        PackageType = meta?.PackageType,
+                        IsEnabled = meta?.Enabled ?? true,
+                        IsLoadedByConfiguration = isLoaded,
+                        IsWinningInLoadOrder = (meta?.Enabled ?? true) && isLoaded
+                    };
+                    var card = Sims3PackDamageCard(filePath, item);
+                    if (card != null) corruptCards.Add(card);
                 });
             }
 
