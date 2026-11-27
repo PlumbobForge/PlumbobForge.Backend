@@ -718,7 +718,8 @@ public class PKGManager
             onProgress?.Invoke("Created missing 'Default' set.");
         }
 
-        var unassignedItems = await _db.MetaEntities.Where(m => m.SetsEntityId == null).ToListAsync();
+        // No set, or a set that no longer exists: either way no set in the sidebar shows them.
+        var unassignedItems = await _db.MetaEntities.Where(m => m.SetsEntityId == null || !_db.SetsEntities.Any(s => s.Id == m.SetsEntityId)).ToListAsync();
         if (unassignedItems.Count > 0)
         {
             foreach (var item in unassignedItems)
