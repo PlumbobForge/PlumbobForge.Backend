@@ -495,6 +495,19 @@ public sealed class MlodModel
         return at >= 0 && at + 16 <= c.Length ? at : -1;
     }
 
+    // FNV-32 of the shader name, or 0 when the mesh has no material.
+    public uint ShaderOf(int mesh)
+    {
+        int at = MaterialChunk(Meshes[mesh]);
+        return at >= 0 && Rcol.Chunks[at].Length >= 16 ? RcolFile.U32(Rcol.Chunks[at], 12) : 0;
+    }
+
+    // Shaders of meshes the game draws only as helpers: shadow planes, and the water in a tub or sink, which shows
+    // only when it is filled. "dropshadow", "shadowmap", "basinwater".
+    private static readonly HashSet<uint> HelperShaders = new() { 0xC09C7582u, 0x21FE207Du, 0x6AAD2AD5u };
+
+    public bool IsHelper(int mesh) => HelperShaders.Contains(ShaderOf(mesh));
+
     // MTNF: index into the external keys. MTRL: key written in place.
     public TGI_Key? DiffuseKey(int mesh)
     {

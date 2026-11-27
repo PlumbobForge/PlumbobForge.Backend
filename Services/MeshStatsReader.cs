@@ -95,9 +95,18 @@ public static class MeshStatsReader
         }
         return allGeoms.Where(g => !listed.Contains(g)).ToList();
     }
-    // OBJD -> OBJK -> MODLs. external: something is missing from the package.
-    internal static List<TGI_Key> ObjectModelKeys(byte[] objd, ResourceReader read, out bool external)
+    // Catalog resources whose model is read like an object's: objects, and wall and floor patterns (their sample
+    // wall or floor tile).
+    public static bool HasObjectModel(uint type) => type == Sims3ResourceTypes.Objd || type == Sims3ResourceTypes.CatalogWallFloorPattern;
+
+    // OBJD -> OBJK -> MODLs, or wall/floor pattern -> VPXY -> MODLs. external: something is missing from the package.
+    internal static List<TGI_Key> ObjectModelKeys(byte[] objd, ResourceReader read, out bool external) =>
+        ObjectModelKeys(Sims3ResourceTypes.Objd, objd, read, out external);
+
+    internal static List<TGI_Key> ObjectModelKeys(uint type, byte[] objd, ResourceReader read, out bool external)
     {
+        if (type == Sims3ResourceTypes.CatalogWallFloorPattern) return PatternModelKeys(objd, read, out external);
+
         var item = new ResourceOBJD(objd);
         var refs = item.ReferenceTable;
         var objkKeys = new List<TGI_Key>();
@@ -134,11 +143,33 @@ public static class MeshStatsReader
         return modlKeys;
     }
 
-    public static MeshStats ReadObject(byte[] objd, ResourceReader read, Dictionary<TGI_Key, MeshLod?>? cache = null)
+    // A wall or floor pattern lists its sample tile's VPXY among its keys.
+    private static List<TGI_Key> PatternModelKeys(byte[] data, ResourceReader read, out bool external)
+    {
+        external = false;
+        var pattern = new CatalogResource.WallFloorPatternCatalogResource(0, new System.IO.MemoryStream(data, writable: false));
+        var keys = pattern.TGIBlocks.Select(t => new TGI_Key(t.ResourceType, t.ResourceGroup, t.Instance)).ToList();
+        int at = (int)pattern.MaterialVPXYIndex;
+        var vpxyKeys = at >= 0 && at < keys.Count && keys[at].Type == Vpxy ? new List<TGI_Key> { keys[at] } : keys.Where(k => k.Type == Vpxy).ToList();
+
+        var modlKeys = new List<TGI_Key>();
+        foreach (var key in vpxyKeys)
+        {
+            var vpxy = read(key);
+            if (vpxy == null) { external = true; continue; }
+            modlKeys.AddRange(ReadChunkTable(vpxy).Where(k => k.Type == Modl));
+        }
+        return modlKeys;
+    }
+
+    public static MeshStats ReadObject(byte[] objd, ResourceReader read, Dictionary<TGI_Key, MeshLod?>? cache = null) =>
+        ReadObject(Sims3ResourceTypes.Objd, objd, read, cache);
+
+    public static MeshStats ReadObject(uint type, byte[] objd, ResourceReader read, Dictionary<TGI_Key, MeshLod?>? cache = null)
     {
         try
         {
-            var modlKeys = ObjectModelKeys(objd, read, out bool external);
+            var modlKeys = ObjectModelKeys(type, objd, read, out bool external);
 
             var levels = new SortedDictionary<int, MeshLod>();
             void AddLevel(int level, MeshLod lod) =>

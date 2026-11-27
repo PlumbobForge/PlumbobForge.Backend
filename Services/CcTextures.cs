@@ -2,6 +2,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -170,7 +171,7 @@ public sealed record CasPreset(string Complate, IReadOnlyDictionary<string, stri
     }
 
     // Game paint patterns: a base colour shifted in HSV.
-    private static double[]? HsvColor(Dictionary<string, string> v)
+    internal static double[]? HsvColor(Dictionary<string, string> v)
     {
         double? N(string key) => v.TryGetValue(key, out var t) && double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ? d : null;
         if (N("Base H Bg") is not double h || N("Base S Bg") is not double sat || N("Base V Bg") is not double val) return null;
@@ -222,7 +223,7 @@ public static class CcMaterial
         {
             if (!value.StartsWith("key:00b2d882:", StringComparison.OrdinalIgnoreCase) || value.Length < 16) continue;
             if (!ulong.TryParse(value[^16..], NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var instance)) continue;
-            if (byInstance.TryGetValue(instance, out var res)) o[role] = res;
+            if ((byInstance.GetValueOrDefault(instance) ?? inspection.Game?.FindByInstance(TextureType, instance)) is { } res) o[role] = res;
         }
         return o;
     }
@@ -508,6 +509,70 @@ public static class CcMaterial
         return own.OrderBy(x => x.Res.Key.Group).SelectMany(x => x.Presets).ToList();
     }
 
+    // A wall or floor pattern's colour variants, or a terrain paint's brush texture, as presets.
+    public static List<CasPreset> PatternPresets(PackageInspection inspection, InspectedResource catalog)
+    {
+        using var ms = new MemoryStream(inspection.Read(catalog), writable: false);
+        if (catalog.Key.Type == Sims3ResourceTypes.CatalogTerrainPaintBrush)
+        {
+            var paint = new CatalogResource.TerrainPaintBrushCatalogResource(0, ms);
+            var brush = paint.BrushTexture;
+            var values = new Dictionary<string, string> { ["Multiplier"] = KeyValue(brush.ResourceType, brush.ResourceGroup, brush.Instance) };
+            return new List<CasPreset> { new("Terrain paint", values, new Dictionary<string, CasPattern>()) };
+        }
+        if (catalog.Key.Type != Sims3ResourceTypes.CatalogWallFloorPattern) return new List<CasPreset>();
+
+        var pattern = new CatalogResource.WallFloorPatternCatalogResource(0, ms);
+        var presets = new List<CasPreset>();
+        foreach (var material in pattern.Materials)
+        {
+            if (material.MaterialBlock is { } block) presets.Add(PresetFromBlock(block, material.TGIBlocks));
+        }
+        return presets;
+    }
+
+    private static string KeyValue(uint type, uint group, ulong instance) => $"key:{type:x8}:{group:x8}:{instance:x16}";
+
+    // A catalog material block holds what a CAS preset's XML holds: the template's values, and one sub-block per
+    // pattern with its colour.
+    private static CasPreset PresetFromBlock(CatalogResource.CatalogResource.MaterialBlock block, IList<s3pi.Interfaces.TGIBlock> keys)
+    {
+        var values = BlockValues(block, keys);
+        var patterns = new Dictionary<string, CasPattern>();
+        foreach (var sub in block.MaterialBlocks)
+        {
+            if (string.IsNullOrEmpty(sub.Pattern)) continue;
+            var v = BlockValues(sub, keys);
+            var color = CasPreset.ParseColor(v.GetValueOrDefault("Color") ?? v.GetValueOrDefault("Color 0")) ?? CasPreset.HsvColor(v);
+            bool enabled = string.Equals(values.GetValueOrDefault(sub.Pattern + " Enabled") ?? "true", "true", StringComparison.OrdinalIgnoreCase);
+            patterns[sub.Pattern] = new CasPattern(sub.Name ?? "", color, enabled);
+        }
+        return new CasPreset(block.Name ?? "", values, patterns);
+    }
+
+    private static Dictionary<string, string> BlockValues(CatalogResource.CatalogResource.MaterialBlock block, IList<s3pi.Interfaces.TGIBlock> keys)
+    {
+        static string F(float f) => f.ToString(CultureInfo.InvariantCulture);
+        var values = new Dictionary<string, string>();
+        foreach (var e in block.ComplateOverrides)
+        {
+            string? value = e switch
+            {
+                CatalogResource.CatalogResource.TC01_String s => s.Data,
+                CatalogResource.CatalogResource.TC02_ARGB c => string.Join(",",
+                    new[] { (c.ARGB >> 16) & 0xFF, (c.ARGB >> 8) & 0xFF, c.ARGB & 0xFF, c.ARGB >> 24 }.Select(x => F(x / 255f))),
+                CatalogResource.CatalogResource.TC03_TGIIndex t => t.TGIIndex < keys.Count
+                    ? KeyValue(keys[t.TGIIndex].ResourceType, keys[t.TGIIndex].ResourceGroup, keys[t.TGIIndex].Instance) : null,
+                CatalogResource.CatalogResource.TC04_Single f => F(f.Unknown1),
+                CatalogResource.CatalogResource.TC05_XY xy => $"{F(xy.Unknown1)},{F(xy.Unknown2)}",
+                CatalogResource.CatalogResource.TC07_Boolean b => b.Unknown1 ? "true" : "false",
+                _ => null
+            };
+            if (value != null && !string.IsNullOrEmpty(e.VariableName)) values[e.VariableName] = value;
+        }
+        return values;
+    }
+
     // The images an object's texture compositor (TXTC) draws from the package, as a preset:
     // multiplied in = Multiplier, blended over = Overlay, split by channel = Mask. Pattern colours come from colours.
     public static CasPreset? CompositorPreset(PackageInspection inspection, InspectedResource txtc, CasPreset? colours = null)
@@ -536,7 +601,7 @@ public static class CcMaterial
             int from = steps[s], to = s + 1 < steps.Count ? steps[s + 1] : keysAt;
             if (TxtcProp(d, from, to, TxtcImage, 0x0C, 1) is not int at || d[at] >= keys.Count) continue;
             var key = keys[d[at]];
-            if (key.Type != TextureType || !inPackage.Contains(key.Instance)) continue;
+            if (key.Type != TextureType || (!inPackage.Contains(key.Instance) && inspection.Game?.FindByInstance(TextureType, key.Instance) == null)) continue;
             int? src = TxtcProp(d, from, to, TxtcSrcBlend, 3, 4) is int a ? BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(a)) : null;
             int? dst = TxtcProp(d, from, to, TxtcDstBlend, 3, 4) is int b ? BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(b)) : null;
             int? write = TxtcProp(d, from, to, TxtcColorWrite, 3, 4) is int c ? BinaryPrimitives.ReadInt32LittleEndian(d.AsSpan(c)) : null;

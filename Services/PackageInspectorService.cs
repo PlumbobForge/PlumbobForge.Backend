@@ -32,6 +32,9 @@ public sealed class PackageInspection : IDisposable
     public List<byte[]> PackPreviews { get; } = new();
     public List<InspectionWarning> Warnings { get; } = new();
 
+    // The game's own files, for a 3D preview of CC that uses the game's models or textures. Only read, never changed.
+    public GameResources? Game { get; set; }
+
     public long TotalBytes => Resources.Sum(r => (long)r.ChunkLength);
 
     internal PackageInspection(string fileName, bool isVault, bool isSims3Pack)

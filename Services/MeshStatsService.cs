@@ -56,9 +56,9 @@ public static class MeshStatsService
                     }
                     return MeshStatsReader.ReadCas(data, reader, orphans, caspCountByPart.GetValueOrDefault(part) == 1, meshCache);
                 }
-                if (obj.Resource.Key.Type == Sims3ResourceTypes.Objd)
+                if (MeshStatsReader.HasObjectModel(obj.Resource.Key.Type))
                 {
-                    return MeshStatsReader.ReadObject(data, reader, meshCache);
+                    return MeshStatsReader.ReadObject(obj.Resource.Key.Type, data, reader, meshCache);
                 }
                 return MeshStats.None;
             }

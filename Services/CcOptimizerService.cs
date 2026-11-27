@@ -37,7 +37,16 @@ public sealed class CcMesh
     public int Vertices => Geom.VertexCount;
     // Tiny dummy meshes left by converters; never reduced.
     public bool IsPlaceholder => Triangles <= 2;
-    public bool CanReduce => !IsPlaceholder && !HasDuplicateKey;
+    // Objects: a shadow plane or tub water, which the game draws only as a helper.
+    public bool IsHelper { get; init; }
+    // What the 3D preview draws. An object's flat parts are real (a rug, a painting's canvas, a glass pane); a CAS
+    // part's tiny meshes are converter leftovers.
+    public bool IsShownInPreview => ObjectMeshIndex != null ? !IsHelper : !IsPlaceholder;
+    public bool CanReduce => !IsPlaceholder && !HasDuplicateKey && !IsGenerated && !IsFromGame;
+    // Read from the game's own packages for the preview; never changed.
+    public bool IsFromGame => Resource.PartIndex == GameResources.GamePart;
+    // Made up for the preview (a terrain paint's flat tile); not in the package.
+    public bool IsGenerated { get; init; }
 
     private CcMeshSimplifier.Layers? _layers;
     private (double Ratio, bool Lock, CcSimplifyResult Result)? _last;
@@ -63,9 +72,18 @@ public sealed class CcAnalysis
     public bool IsObject { get; init; }
     // The CAS part whose presets colour the preview.
     public InspectedResource? Casp { get; init; }
+    // A wall or floor pattern or a terrain paint: its colour variants colour the whole tile, like a CAS part's presets.
+    public InspectedResource? Pattern { get; init; }
+    // Objects are painted mesh by mesh, from their own materials; everything else gets one texture from a preset.
+    public bool UsesObjectTextures => IsObject && Pattern == null;
 
     public List<CasPreset> ReadPresets(PackageInspection inspection)
     {
+        if (Pattern != null)
+        {
+            try { return CcMaterial.PatternPresets(inspection, Pattern); }
+            catch (Exception) { return new List<CasPreset>(); }
+        }
         if (IsObject)
         {
             if (!Meshes.Any(m => m.Compositor != null)) return new List<CasPreset>();
@@ -138,6 +156,8 @@ public sealed class CcAnalysis
     public int TrianglesIn(int lod) => MeshesIn(lod).Sum(m => m.Triangles);
     public int RealTrianglesIn(int lod) => MeshesIn(lod).Where(m => !m.IsPlaceholder).Sum(m => m.Triangles);
     public int RealTrianglesNowIn(int lod) => MeshesIn(lod).Where(m => !m.IsPlaceholder).Sum(m => m.TrianglesNow);
+    public IEnumerable<CcMesh> PreviewMeshesIn(int lod) => MeshesIn(lod).Where(m => m.IsShownInPreview);
+    public int PreviewTrianglesIn(int lod) => PreviewMeshesIn(lod).Sum(m => m.Triangles);
 
     // Built from backed-up originals.
     public bool IsFromOriginals => Meshes.Any(m => m.StoredTriangles != null);
@@ -240,9 +260,11 @@ public class CcOptimizerService
     }
 
     // casPart: one CAS part or OBJD; null for the whole package.
-    public static CcAnalysis Analyse(PackageInspection inspection, TGI_Key? casPart = null, CancellationToken ct = default)
+    // game: the game's own packages, for objects whose model is the game's (preview only; the optimizer leaves it out).
+    public static CcAnalysis Analyse(PackageInspection inspection, TGI_Key? casPart = null, CancellationToken ct = default, GameResources? game = null)
     {
-        var analysis = AnalyseCore(inspection, casPart, ct);
+        if (game != null) inspection.Game = game;
+        var analysis = AnalyseCore(inspection, casPart, ct, game);
         if (inspection.Originals.Count > 0) MeasureStored(inspection, analysis);
         return analysis;
     }
@@ -274,13 +296,19 @@ public class CcOptimizerService
         }
     }
 
-    private static CcAnalysis AnalyseCore(PackageInspection inspection, TGI_Key? casPart, CancellationToken ct)
+    private static CcAnalysis AnalyseCore(PackageInspection inspection, TGI_Key? casPart, CancellationToken ct, GameResources? game)
     {
-        if (casPart?.Type == Objd || (casPart == null
-            && !inspection.Resources.Any(r => r.Key.Type == GeomMesh.ResourceType)
-            && inspection.Resources.Any(r => r.Key.Type == Objd)))
+        if (casPart is { Type: Sims3ResourceTypes.CatalogTerrainPaintBrush } paintKey
+            && inspection.Resources.FirstOrDefault(r => r.Key == paintKey) is { } paint)
         {
-            return AnalyseObject(inspection, casPart == AllObjects ? null : casPart, ct);
+            return AnalyseTerrainPaint(paint);
+        }
+
+        if ((casPart is { } part && MeshStatsReader.HasObjectModel(part.Type)) || (casPart == null
+            && !inspection.Resources.Any(r => r.Key.Type == GeomMesh.ResourceType)
+            && inspection.Resources.Any(r => MeshStatsReader.HasObjectModel(r.Key.Type))))
+        {
+            return AnalyseObject(inspection, casPart == AllObjects ? null : casPart, ct, game);
         }
 
         var warnings = new List<string>();
@@ -399,21 +427,26 @@ public class CcOptimizerService
     }
 
     // Objects: OBJD -> OBJK -> MODL -> MLOD. Shadows are skipped.
-    private static CcAnalysis AnalyseObject(PackageInspection inspection, TGI_Key? objdKey, CancellationToken ct)
+    private static CcAnalysis AnalyseObject(PackageInspection inspection, TGI_Key? objdKey, CancellationToken ct, GameResources? game)
     {
         var warnings = new List<string>();
-        var objds = inspection.Resources.Where(r => r.Key.Type == Objd && (objdKey == null || r.Key == objdKey)).ToList();
+        // Objects, and wall and floor patterns (their sample tile).
+        var objds = inspection.Resources.Where(r => MeshStatsReader.HasObjectModel(r.Key.Type) && (objdKey == null || r.Key == objdKey)).ToList();
 
-        InspectedResource? Find(TGI_Key key, int part) =>
+        InspectedResource? InPackage(TGI_Key key, int part) =>
             inspection.Resources.FirstOrDefault(r => r.Key == key && r.PartIndex == part) ?? inspection.Resources.FirstOrDefault(r => r.Key == key);
+        // What the package doesn't hold comes from the game's own packages, when they are given.
+        InspectedResource? Find(TGI_Key key, int part) => InPackage(key, part) ?? game?.Find(key);
 
         // Older materials often have the wrong group, so match by type and instance too.
         InspectedResource? FindTexture(TGI_Key? key, int part, uint type = CcMaterial.TextureType)
         {
             if (key is not { } k || k.Type != type) return null;
-            return Find(k, part)
+            return InPackage(k, part)
                 ?? inspection.Resources.FirstOrDefault(r => r.Key.Type == k.Type && r.Key.Instance == k.Instance && r.PartIndex == part)
-                ?? inspection.Resources.FirstOrDefault(r => r.Key.Type == k.Type && r.Key.Instance == k.Instance);
+                ?? inspection.Resources.FirstOrDefault(r => r.Key.Type == k.Type && r.Key.Instance == k.Instance)
+                ?? game?.Find(k)
+                ?? game?.FindByInstance(k.Type, k.Instance);
         }
 
         // -1 = the whole MLOD resource.
@@ -435,7 +468,7 @@ public class CcOptimizerService
             List<TGI_Key> modlKeys;
             try
             {
-                modlKeys = MeshStatsReader.ObjectModelKeys(inspection.Read(objd), k => Find(k, objd.PartIndex) is { } r ? inspection.Read(r) : null, out bool ext);
+                modlKeys = MeshStatsReader.ObjectModelKeys(objd.Key.Type, inspection.Read(objd), k => Find(k, objd.PartIndex) is { } r ? inspection.Read(r) : null, out bool ext);
                 external |= ext;
             }
             catch (Exception ex)
@@ -511,8 +544,9 @@ public class CcOptimizerService
                             Geom = GeomMesh.FromArrays(g.Positions, g.Normals, g.Uvs, g.Indices),
                             Lod = level,
                             Slot = slot++,
-                            HasDuplicateKey = keyCounts[(owner.PartIndex, owner.Key)] > 1,
+                            HasDuplicateKey = keyCounts.GetValueOrDefault((owner.PartIndex, owner.Key)) > 1,
                             ObjectMeshIndex = i,
+                            IsHelper = model.IsHelper(i),
                             Diffuse = FindTexture(diffuseKey, owner.PartIndex),
                             Compositor = FindTexture(diffuseKey, owner.PartIndex, Txtc),
                         });
@@ -526,7 +560,45 @@ public class CcOptimizerService
         }
 
         var ordered = meshes.OrderBy(m => m.Lod).ThenBy(m => m.Slot).ToList();
-        return new CcAnalysis { Meshes = ordered, Warnings = warnings, IsObject = true };
+        // A wall or floor pattern's tile is coloured by the pattern, not by the tile's own material.
+        var pattern = objds.Count > 0 && objds.All(o => o.Key.Type == Sims3ResourceTypes.CatalogWallFloorPattern) ? objds[0] : null;
+        return new CcAnalysis { Meshes = ordered, Warnings = warnings, IsObject = true, Pattern = pattern };
+    }
+
+    // A terrain paint has no model: it is shown on a flat patch of ground, one metre across.
+    private static CcAnalysis AnalyseTerrainPaint(InspectedResource paint)
+    {
+        const int cells = 8;
+        var positions = new List<float>();
+        var normals = new List<float>();
+        var uvs = new List<float>();
+        for (int z = 0; z <= cells; z++)
+        {
+            for (int x = 0; x <= cells; x++)
+            {
+                float u = x / (float)cells, v = z / (float)cells;
+                positions.AddRange(new[] { u - 0.5f, 0f, v - 0.5f });
+                normals.AddRange(new[] { 0f, 1f, 0f });
+                uvs.AddRange(new[] { u, v });
+            }
+        }
+        var indices = new List<uint>();
+        for (int z = 0; z < cells; z++)
+        {
+            for (int x = 0; x < cells; x++)
+            {
+                uint a = (uint)(z * (cells + 1) + x), b = a + 1, c = a + cells + 1, d = c + 1;
+                indices.AddRange(new[] { a, c, b, b, c, d });
+            }
+        }
+        var tile = new CcMesh
+        {
+            Resource = paint,
+            Geom = GeomMesh.FromArrays(positions.ToArray(), normals.ToArray(), uvs.ToArray(), indices.ToArray()),
+            Lod = 0,
+            IsGenerated = true,
+        };
+        return new CcAnalysis { Meshes = new[] { tile }, IsObject = true, Pattern = paint };
     }
 
     // From backups, reductions start from the original and 100% restores it.

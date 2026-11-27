@@ -88,6 +88,8 @@ public class MeshReportService
         {
             var mesh = obj.Mesh;
             if (mesh == null) continue;
+            // A wall or floor pattern's model is only the sample tile shown in the catalog.
+            if (obj.Resource.Key.Type == Sims3ResourceTypes.CatalogWallFloorPattern) continue;
             if (!mesh.HasData)
             {
                 if (mesh.HasExternalMesh) external++;
