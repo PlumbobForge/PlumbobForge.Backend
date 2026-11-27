@@ -53,6 +53,53 @@ public class ThumbnailService
         catch { }
     }
 
+    // Previews are named by item id, and the ids start again in a new database (app data deleted, a reinstall that
+    // kept the Documents folder), so an old preview would show on whatever item now has its id. A marker ties the
+    // folder to one database; previews made for another one are removed and read again from each item's own file.
+    // Folders from before the marker existed are refreshed once, which also repairs ones that already show wrong.
+    private const string DatabaseMarkerFile = "database.id";
+    private static readonly string[] PreviewExtensions = { ".thumb", ".nothumb", ".fallback" };
+
+    public void EnsureCacheMatchesDatabase()
+    {
+        try
+        {
+            string id = DatabaseId(_db);
+            string thumbDir = GetThumbnailDirectory();
+            string markerPath = Path.Combine(thumbDir, DatabaseMarkerFile);
+            string? previous = null;
+            try { previous = File.Exists(markerPath) ? File.ReadAllText(markerPath).Trim() : null; } catch { }
+            if (previous == id) return;
+
+            int removed = 0;
+            foreach (string file in Directory.EnumerateFiles(thumbDir).ToList())
+            {
+                if (!PreviewExtensions.Contains(Path.GetExtension(file), StringComparer.OrdinalIgnoreCase)) continue;
+                TryDelete(file);
+                removed++;
+                if (long.TryParse(Path.GetFileNameWithoutExtension(file), out long itemId)) ThumbnailDeleted?.Invoke(itemId);
+            }
+            File.WriteAllText(markerPath, id);
+            AppLogger.LogInfo(previous == null
+                ? $"Refreshing {removed} previews made before they were tied to the database"
+                : $"Removed {removed} previews made for another database", "ThumbnailService");
+        }
+        catch (Exception ex)
+        {
+            AppLogger.LogWarning("Could not check the previews against the database", ex, "ThumbnailService");
+        }
+    }
+
+    // A random id kept in the database itself, so it goes away with it.
+    private static string DatabaseId(AppDbContext db)
+    {
+        db.Database.ExecuteSqlRaw("CREATE TABLE IF NOT EXISTS AppInfo (Key TEXT PRIMARY KEY NOT NULL, Value TEXT NOT NULL);");
+        string? Read() => db.Database.SqlQueryRaw<string>("SELECT Value FROM AppInfo WHERE Key = 'DatabaseId'").AsEnumerable().FirstOrDefault();
+        if (Read() is { Length: > 0 } existing) return existing;
+        db.Database.ExecuteSqlRaw("INSERT OR IGNORE INTO AppInfo (Key, Value) VALUES ('DatabaseId', {0});", Guid.NewGuid().ToString("N"));
+        return Read() ?? throw new InvalidOperationException("The database id could not be saved");
+    }
+
     public async Task<int> CleanupOrphanedThumbnailsAsync()
     {
         return await Task.Run(async () =>
@@ -70,8 +117,7 @@ public class ThumbnailService
 
                 foreach (var file in files)
                 {
-                    var ext = Path.GetExtension(file).ToLowerInvariant();
-                    if (ext != ".thumb" && ext != ".nothumb") continue;
+                    if (!PreviewExtensions.Contains(Path.GetExtension(file), StringComparer.OrdinalIgnoreCase)) continue;
 
                     var name = Path.GetFileNameWithoutExtension(file);
                     if (long.TryParse(name, out var id))
