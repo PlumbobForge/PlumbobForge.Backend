@@ -16,6 +16,22 @@ public static class PackageTypeHelper
 
     public const uint TypeOBJD = 0x319E4F1D;
 
+    // The Other Content choices of the retag dialog (and filters): worlds, Sims and lots are types of their own, the
+    // rest is "Other". The cache build and the filters go by the type, not by the chosen category.
+    public static string OtherTypeFor(string? category) => category?.Trim().ToLowerInvariant() switch
+    {
+        "worlds" => World,
+        "sims" => Sim,
+        "lots" => Lot,
+        _ => Other
+    };
+
+    public static string? OtherCategoryFor(string? type) =>
+        string.Equals(type, World, StringComparison.OrdinalIgnoreCase) ? "Worlds"
+        : string.Equals(type, Sim, StringComparison.OrdinalIgnoreCase) ? "Sims"
+        : string.Equals(type, Lot, StringComparison.OrdinalIgnoreCase) ? "Lots"
+        : null;
+
     // Kept as a list so EF Core can translate it to SQL (m.PackageType IN (...)).
     public static readonly string[] BuildBuyTypes =
     [
