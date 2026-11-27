@@ -38,6 +38,8 @@ public class PlumbobForgeOptions
     // Off by default: deleting compositorCache/simCompositorCache makes the game rebuild textures while it runs (stutter).
     public bool AutoClearGameCaches { get; set; } = false;
     public bool OptimizeTextures { get; set; } = false;
+    // Accessibility: a set or Mods folder lists the items of its sub-sets or sub-folders too, so one click shows them all.
+    public bool ShowSubfolderItems { get; set; } = false;
     // 0 means no cap.
     public int TextureMaxDimension { get; set; } = 2048;
     public System.Collections.Generic.List<string> ObservedFolders { get; set; } = new();
